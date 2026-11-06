@@ -73,7 +73,7 @@ diff --git a/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hy
      },
      assignHomeLazyImageSource(image, src, priority = 2) {
 +      // Fade only for new src assignments. No replay when focus changes.
-+      if (image.classList.contains("content-poster") && !image.getAttribute("src")) {
++      if (image.classList.contains("content-poster") && !image.getAttribute("src") && typeof image.classList.add === "function" && typeof image.addEventListener === "function" && typeof image.removeEventListener === "function") {
 +        image.c1FinishPosterFade?.();
 +        image.classList.add("c1-poster-loading");
 +        const finish = () => {

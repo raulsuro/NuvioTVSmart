@@ -1,0 +1,156 @@
+name: Nuvio LG C1 - patched webOS IPK
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Upstream stable version, e.g. 1.3.7 (blank = highest stable tag)'
+        required: false
+        type: string
+      force_rebuild:
+        description: 'Rebuild even if this version already has a custom release'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '27 5 * * *' # Daily; only builds newly tagged versions.
+
+permissions:
+  contents: write # Creates downloadable custom IPK releases on YOUR fork.
+
+concurrency:
+  group: nuvio-c1-custom-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out customizations from my fork
+        uses: actions/checkout@v4
+        with:
+          path: custom
+
+      - name: Resolve latest stable upstream tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            tag="$REQUESTED_TAG"
+          else
+            # 'releases/latest' can lag behind the app update feed; use published
+            # stable Git tags. Never auto-select a prerelease tag.
+            tag="$(gh api --paginate 'repos/NuvioMedia/NuvioTVSmart/tags?per_page=100' \
+              --jq '.[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
+          fi
+          [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid stable tag: $tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Selected upstream tag $tag"
+
+      - name: Skip release if already built
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          FORCE: ${{ inputs.force_rebuild }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$FORCE" != 'true' ]] && gh release view "c1-${TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'skip=true' >> "$GITHUB_OUTPUT"
+            echo "c1-${TAG} was built previously. Nothing to do."
+          else
+            echo 'skip=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout EXACT upstream release tag
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: NuvioMedia/NuvioTVSmart
+          ref: ${{ steps.version.outputs.tag }}
+          path: nuvio
+
+      - name: Apply all local patches (stop on conflict)
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in nuvio_webos_reliability.patch nuvio_webos_ui_performance.patch nuvio_home_performance_v2.patch; do
+            echo "Checking and applying $p"
+            git apply --check "$GITHUB_WORKSPACE/custom/custom-patches/$p"
+            git apply "$GITHUB_WORKSPACE/custom/custom-patches/$p"
+          done
+          git diff --check
+
+      - name: Setup Node.js
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: nuvio/package-lock.json
+
+      - name: Install dependencies
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: nuvio
+        run: npm ci
+
+      - name: Run targeted reliability and artwork tests
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test js/platform/webos/webosCompanionService.test.mjs
+          node --test js/ui/screens/search/searchPosterHydration.test.mjs
+          node --test js/ui/images/tvPosterRescalerWarmCache.test.mjs js/ui/screens/home/homeImageCommitQueue.test.mjs
+          node --test js/ui/images/tvPosterRescalerPool.test.mjs js/ui/screens/home/homeArtworkLifecycle.test.mjs
+
+      - name: Lint and build webOS package
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run lint:runtime
+          npm run package:webos
+          test -f "space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk"
+          sha256sum "space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk" > checksums.sha256
+
+      - name: Upload IPK as build artifact
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuvio-lg-c1-${{ steps.version.outputs.tag }}
+          path: |
+            nuvio/space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk
+            nuvio/checksums.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish persistent custom release on my fork
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "c1-${TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'A release already exists. Leaving it untouched; new build is in Actions artifacts.'
+            exit 0
+          fi
+          gh release create "c1-${TAG}" \
+            "nuvio/space.nuvio.webos_${TAG}_all.ipk" \
+            'nuvio/checksums.sha256' \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${GITHUB_SHA}" \
+            --title "Nuvio ${TAG} - LG C1 patched" \
+            --notes 'Built from the upstream Nuvio tag with custom webOS reliability, Search and Home optimization patches. Patch conflicts, tests and lint fail the build. Not an official Nuvio release. Install manually over the previous app; retain your working IPK for rollback.' \
+            --latest=false

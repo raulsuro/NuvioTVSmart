@@ -1,0 +1,376 @@
+diff --git a/js/ui/screens/home/homeScreenMethods-20-mount.js b/js/ui/screens/home/homeScreenMethods-20-mount.js
+--- a/js/ui/screens/home/homeScreenMethods-20-mount.js
++++ b/js/ui/screens/home/homeScreenMethods-20-mount.js
+@@ -168,5 +168,8 @@
+         this.ensureHomeTruncationObservers();
+         this.scheduleHomeTruncationUpdate();
+-        this.scheduleHomeLazyImageHydration();
++        // Search may have released Home's decoded posters while this preserved
++        // DOM was hidden. Prioritize the restored focused card on return and
++        // rebuild the index before loading nearby artwork.
++        this.scheduleHomeLazyImageHydration(this.getCurrentFocusedNode(), { refreshIndex: true });
+         this.scheduleReturnFocusRestore();
+         this.ensureStartupSyncSubscription();
+diff --git a/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js b/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js
+--- a/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js
++++ b/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js
+@@ -1,4 +1,9 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import {
++  bindSearchPosterHydration,
++  captureLoadedSearchPosters,
++  restoreLoadedSearchPosters
++} from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods01() {
+@@ -336,4 +341,5 @@
+       const preserveInputEditing = document.activeElement === input;
+       const selectionSnapshot = preserveInputEditing ? null : getInputSelectionSnapshot(input);
++      const loadedPosters = captureLoadedSearchPosters(content);
+ 
+       while (header.nextSibling) {
+@@ -342,2 +348,3 @@
+       content.insertAdjacentHTML("beforeend", this.renderRows());
++      restoreLoadedSearchPosters(content, loadedPosters);
+       ScreenUtils.indexFocusables(this.container);
+@@ -354,3 +361,4 @@
+       this.pendingAutoFocusResults = false;
++      bindSearchPosterHydration(this);
+     }
+   };
+diff --git a/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js b/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js
+--- a/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js
++++ b/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js
+@@ -1,4 +1,5 @@
+ import { customPosterForItem, posterFallbackAttributes } from "../../../core/poster/customPoster.js";
++import { normalizeTmdbPosterUrl } from "../../../core/tmdb/tmdbImageUrl.js";
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
+ 
+@@ -26,4 +27,5 @@
+     formatReleaseYear,
+     withTimeout,
+-    buildRowStateKey
++    buildRowStateKey,
++    getTvRuntimePerformanceProfile
+   } = internals;
+@@ -237,2 +239,3 @@
+     renderRows() {
++      const useManagedPosters = getTvRuntimePerformanceProfile().isTvRuntime;
+       if (!Array.isArray(this.rows) || !this.rows.length) {
+@@ -277,2 +280,5 @@
+-                .map((item) => customPosterForItem(item, "search"))
++                .map((item) => {
++                  const visual = customPosterForItem(item, "search");
++                  return { ...visual, poster: normalizeTmdbPosterUrl(visual.poster) };
++                })
+                 .map(
+@@ -293,3 +299,3 @@
+-                    ${item.poster ? `<img class="search-result-poster" ${posterFallbackAttributes(item)} src="${item.poster}" alt="" loading="lazy" decoding="async" />` : `<div class="search-result-poster placeholder"></div>`}
++                    ${item.poster ? `<img class="search-result-poster" ${posterFallbackAttributes(item)} ${useManagedPosters ? `data-src="${escapeHtml(item.poster)}"` : `src="${escapeHtml(item.poster)}"`} alt="" loading="${useManagedPosters ? "eager" : "lazy"}" decoding="async" />` : `<div class="search-result-poster placeholder"></div>`}
+                     ${isTitleItemWatched(item, this.watchedTitleIds) ? renderTitleWatchedBadge() : ""}
+                   </div>
+diff --git a/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js b/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js
+--- a/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js
++++ b/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js
+@@ -1,4 +1,9 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import {
++  bindSearchPosterHydration,
++  captureLoadedSearchPosters,
++  restoreLoadedSearchPosters
++} from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods03() {
+@@ -67,4 +72,5 @@
+     render() {
+       this.cancelScheduledRender();
+       const queryText = this.query || "";
++      const loadedPosters = captureLoadedSearchPosters(this.container);
+       this.container.innerHTML = `
+@@ -115,3 +121,4 @@
+           </div>
+         `;
++      restoreLoadedSearchPosters(this.container, loadedPosters);
+       this.searchRouteEnterPending = false;
+@@ -139,4 +146,5 @@
+       } else {
+         this.pendingAutoFocusResults = false;
+       }
++      bindSearchPosterHydration(this);
+     },
+diff --git a/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js b/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js
+--- a/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js
++++ b/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js
+@@ -1,4 +1,5 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import { scheduleSearchPosterHydration } from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods04() {
+@@ -112,4 +113,5 @@
+       }
+       this.captureLiveViewState();
++      scheduleSearchPosterHydration(this);
+       return true;
+     },
+diff --git a/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js b/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js
+--- a/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js
++++ b/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js
+@@ -1,4 +1,5 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import { unbindSearchPosterHydration } from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods06() {
+@@ -307,2 +308,3 @@
+       this.cancelScheduledRender();
++      unbindSearchPosterHydration(this);
+       this.cancelPendingPosterHold();
+diff --git a/js/ui/screens/search/searchPosterHydration.js b/js/ui/screens/search/searchPosterHydration.js
+new file mode 100644
+--- /dev/null
++++ b/js/ui/screens/search/searchPosterHydration.js
+@@ -0,0 +1,103 @@
++/**
++ * Bounded artwork loading for Smart TV search results.
++ *
++ * webOS Chromium can defer native loading="lazy" indefinitely for images in
++ * nested horizontal/vertical scroll containers. Search owns hydration just
++ * like Discover, and only starts nearby images in small per-frame batches.
++ */
++export const SEARCH_POSTER_PREFETCH_MARGIN_PX = 240;
++export const SEARCH_POSTER_BATCH_SIZE = 8;
++
++function overlaps(first, second, margin = 0) {
++  return (
++    first.bottom >= second.top - margin &&
++    first.top <= second.bottom + margin &&
++    first.right >= second.left - margin &&
++    first.left <= second.right + margin
++  );
++}
++
++export function hydrateSearchPosters(container, { margin = SEARCH_POSTER_PREFETCH_MARGIN_PX, batchSize = SEARCH_POSTER_BATCH_SIZE } = {}) {
++  const content = container?.querySelector?.(".search-content");
++  if (!content) return 0;
++  const viewport = content.getBoundingClientRect();
++  let started = 0;
++  for (const image of content.querySelectorAll(".search-result-poster[data-src]")) {
++    if (started >= batchSize) break;
++    if (!image.isConnected) continue;
++    const bounds = image.getBoundingClientRect();
++    if (!overlaps(bounds, viewport, margin)) continue;
++    const track = image.closest(".search-results-track");
++    if (track && !overlaps(bounds, track.getBoundingClientRect(), margin)) continue;
++    const source = String(image.dataset.src || "").trim();
++    image.removeAttribute("data-src");
++    if (!source) continue;
++    // The app has already decided this image is near the visible area.
++    image.loading = "eager";
++    image.src = source;
++    started += 1;
++  }
++  return started;
++}
++
++/** Capture complete image nodes so a Search re-render does not re-decode them. */
++export function captureLoadedSearchPosters(container) {
++  const loaded = new Map();
++  container?.querySelectorAll?.(".search-result-card .search-result-poster").forEach((image) => {
++    if (!image.complete || !(image.naturalWidth > 0)) return;
++    const card = image.closest(".search-result-card");
++    const source = image.getAttribute("src");
++    if (!card || !source) return;
++    const key = JSON.stringify([card.dataset.rowKey, card.dataset.itemType, card.dataset.itemId, source]);
++    loaded.set(key, image);
++  });
++  return loaded;
++}
++
++export function restoreLoadedSearchPosters(container, loaded) {
++  if (!loaded?.size) return 0;
++  let reused = 0;
++  container?.querySelectorAll?.(".search-result-card .search-result-poster").forEach((image) => {
++    const card = image.closest(".search-result-card");
++    if (!card) return;
++    const source = image.dataset.src || image.getAttribute("src");
++    const key = JSON.stringify([card.dataset.rowKey, card.dataset.itemType, card.dataset.itemId, source]);
++    const previous = loaded.get(key);
++    if (!previous || !image.parentNode) return;
++    image.parentNode.replaceChild(previous, image);
++    loaded.delete(key);
++    reused += 1;
++  });
++  return reused;
++}
++
++export function scheduleSearchPosterHydration(screen) {
++  if (!screen?.container || screen.searchPosterHydrationFrame) return;
++  screen.searchPosterHydrationFrame = requestAnimationFrame(() => {
++    screen.searchPosterHydrationFrame = 0;
++    if (!screen.searchPosterScrollTarget?.isConnected) return;
++    const started = hydrateSearchPosters(screen.container);
++    if (started === SEARCH_POSTER_BATCH_SIZE) scheduleSearchPosterHydration(screen);
++  });
++}
++
++/** Capture scroll events from the main viewport AND its nested result tracks. */
++export function bindSearchPosterHydration(screen) {
++  const content = screen?.container?.querySelector?.(".search-content");
++  if (screen.searchPosterScrollTarget !== content) {
++    screen.searchPosterScrollTarget?.removeEventListener("scroll", screen.searchPosterScrollHandler, true);
++    screen.searchPosterScrollTarget = content || null;
++    if (!screen.searchPosterScrollHandler) {
++      screen.searchPosterScrollHandler = () => scheduleSearchPosterHydration(screen);
++    }
++    content?.addEventListener("scroll", screen.searchPosterScrollHandler, { capture: true, passive: true });
++  }
++  scheduleSearchPosterHydration(screen);
++}
++
++export function unbindSearchPosterHydration(screen) {
++  screen.searchPosterScrollTarget?.removeEventListener("scroll", screen.searchPosterScrollHandler, true);
++  screen.searchPosterScrollTarget = null;
++  if (screen.searchPosterHydrationFrame) cancelAnimationFrame(screen.searchPosterHydrationFrame);
++  screen.searchPosterHydrationFrame = 0;
++}
+diff --git a/js/ui/screens/search/searchPosterHydration.test.mjs b/js/ui/screens/search/searchPosterHydration.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/js/ui/screens/search/searchPosterHydration.test.mjs
+@@ -0,0 +1,132 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  hydrateSearchPosters,
++  captureLoadedSearchPosters,
++  restoreLoadedSearchPosters,
++  bindSearchPosterHydration,
++  unbindSearchPosterHydration
++} from "./searchPosterHydration.js";
++
++const rect = (top = 0, left = 0, width = 220, height = 330) => ({
++  top, left, bottom: top + height, right: left + width, width, height
++});
++
++function fixture({ posters = [{ url: "https://art/one.jpg", top: 80, left: 20 }] } = {}) {
++  const cards = [];
++  const images = [];
++  const trackBounds = rect(50, 0, 600, 400);
++  const track = { getBoundingClientRect: () => trackBounds };
++  const content = {
++    isConnected: true,
++    listeners: new Map(),
++    getBoundingClientRect: () => rect(0, 0, 1920, 1080),
++    querySelectorAll: (selector) => {
++      assert.equal(selector, ".search-result-poster[data-src]");
++      return images.filter((image) => image.dataset.src);
++    },
++    addEventListener(type, callback) { this.listeners.set(type, callback); },
++    removeEventListener(type) { this.listeners.delete(type); }
++  };
++  const container = {
++    querySelector: (selector) => selector === ".search-content" ? content : null,
++    querySelectorAll: (selector) => selector === ".search-result-card .search-result-poster" ? images : []
++  };
++  for (const [index, poster] of posters.entries()) {
++    const card = { dataset: { rowKey: "row-a", itemType: "movie", itemId: String(index + 1) } };
++    const source = poster.url;
++    const attrs = new Map();
++    const image = {
++      isConnected: true,
++      complete: false,
++      naturalWidth: 0,
++      dataset: { src: source },
++      loading: "lazy",
++      getBoundingClientRect: () => rect(poster.top, poster.left),
++      getAttribute: (key) => attrs.get(key) || null,
++      removeAttribute: (key) => { attrs.delete(key); if (key === "data-src") delete image.dataset.src; },
++      closest: (selector) => selector === ".search-results-track" ? track : selector === ".search-result-card" ? card : null,
++      parentNode: { replaceChild(newNode, oldNode) { const i = images.indexOf(oldNode); images[i] = newNode; newNode.parentNode = this; } }
++    };
++    Object.defineProperty(image, "src", { get() { return attrs.get("src") || ""; }, set(value) { attrs.set("src", value); } });
++    images.push(image);
++    cards.push(card);
++  }
++  return { content, container, images, cards, trackBounds };
++}
++
++test("loads nearby Search posters without depending on native lazy loading", () => {
++  const { container, images } = fixture({ posters: [
++    { url: "near", top: 100, left: 10 },
++    { url: "far", top: 4500, left: 10 }
++  ] });
++  assert.equal(hydrateSearchPosters(container), 1);
++  assert.equal(images[0].src, "near");
++  assert.equal(images[0].loading, "eager");
++  assert.equal(images[1].src, "");
++  assert.equal(images[1].dataset.src, "far");
++});
++
++test("does not trigger far-right images in a nested horizontal track", () => {
++  const { container, images } = fixture({ posters: [
++    { url: "near", top: 100, left: 50 },
++    { url: "offscreen", top: 100, left: 2000 }
++  ] });
++  assert.equal(hydrateSearchPosters(container), 1);
++  assert.equal(images[1].src, "");
++});
++
++test("limits image requests per frame", () => {
++  const { container, images } = fixture({ posters: Array.from({ length: 12 }, (_, i) => ({ url: `p${i}`, top: 100, left: 20 })) });
++  assert.equal(hydrateSearchPosters(container, { batchSize: 4 }), 4);
++  assert.equal(images.filter((image) => Boolean(image.src)).length, 4);
++  assert.equal(hydrateSearchPosters(container, { batchSize: 4 }), 4);
++  assert.equal(images.filter((image) => Boolean(image.src)).length, 8);
++});
++
++test("reuses complete poster nodes across Search rerenders", () => {
++  const original = fixture();
++  hydrateSearchPosters(original.container);
++  original.images[0].complete = true;
++  original.images[0].naturalWidth = 300;
++  const cache = captureLoadedSearchPosters(original.container);
++  const rerendered = fixture();
++  assert.equal(restoreLoadedSearchPosters(rerendered.container, cache), 1);
++  assert.equal(rerendered.images[0], original.images[0]);
++  assert.equal(rerendered.images[0].src, "https://art/one.jpg");
++});
++
++test("does not reuse a poster after the URL changes", () => {
++  const original = fixture();
++  hydrateSearchPosters(original.container);
++  original.images[0].complete = true;
++  original.images[0].naturalWidth = 300;
++  const cache = captureLoadedSearchPosters(original.container);
++  const updated = fixture({ posters: [{ url: "https://art/different.jpg", top: 80, left: 20 }] });
++  assert.equal(restoreLoadedSearchPosters(updated.container, cache), 0);
++  assert.equal(updated.images[0].src, "");
++});
++
++test("scroll events hydrate additional posters and cleanup cancels work", () => {
++  const { content, container, images } = fixture();
++  let sequence = 0;
++  const pending = new Map();
++  const oldRaf = globalThis.requestAnimationFrame;
++  const oldCancel = globalThis.cancelAnimationFrame;
++  globalThis.requestAnimationFrame = (callback) => { pending.set(++sequence, callback); return sequence; };
++  globalThis.cancelAnimationFrame = (id) => pending.delete(id);
++  try {
++    const screen = { container, searchPosterHydrationFrame: 0 };
++    bindSearchPosterHydration(screen);
++    assert.equal(content.listeners.has("scroll"), true);
++    for (const [id, callback] of [...pending]) { pending.delete(id); callback(); }
++    assert.equal(images[0].src, "https://art/one.jpg");
++    content.listeners.get("scroll")();
++    unbindSearchPosterHydration(screen);
++    assert.equal(content.listeners.has("scroll"), false);
++    assert.equal(pending.size, 0);
++  } finally {
++    globalThis.requestAnimationFrame = oldRaf;
++    globalThis.cancelAnimationFrame = oldCancel;
++  }
++});

@@ -1,0 +1,195 @@
+--- a/js/platform/webos/webosCompanionService.js
++++ b/js/platform/webos/webosCompanionService.js
+@@ -2,6 +2,7 @@
+ 
+ const WEBOS_COMPANION_SERVICE_ID = "space.nuvio.webos.service";
+ const RECOVERABLE_METHODS = new Set(["ping", "status"]);
++const RECOVERABLE_SUBSCRIPTIONS = new Set(["enginefsKeepAlive", "playbackServiceKeepAlive"]);
+ 
+ function waitBeforeRecoveryRetry() {
+   return new Promise((resolve) => setTimeout(resolve, 100));
+@@ -86,10 +87,77 @@
+     };
+   }
+ 
+-  return WebOsLunaService.subscribe(`luna://${serviceId}`, {
+-    method,
+-    parameters,
+-    onSuccess,
+-    onFailure
+-  });
++  // webOS may evict a Luna JS service between source selection and player
++  // startup. Keep-alive subscriptions must recover without a permanent
++  // external SSH process. Scope reconnection to playback keep-alives: other
++  // subscriptions retain their existing lifecycle and failure semantics.
++  const recoverable = RECOVERABLE_SUBSCRIPTIONS.has(method);
++  let closed = false;
++  let generation = 0;
++  let retryTimer = null;
++  let failures = 0;
++  let handle = null;
++
++  const scheduleRetry = () => {
++    if (!recoverable || closed || retryTimer) return;
++    const delayMs = Math.min(8000, 250 * 2 ** Math.min(failures, 5));
++    failures += 1;
++    retryTimer = setTimeout(() => {
++      retryTimer = null;
++      connect();
++    }, delayMs);
++  };
++
++  const connect = () => {
++    if (closed) return;
++    // Increment first, so a cancellation callback from the old handle cannot
++    // schedule another reconnect after a newer subscription has replaced it.
++    const currentGeneration = ++generation;
++    try {
++      handle?.cancel?.();
++    } catch (_) {
++      // A terminated webOS service may leave a handle that cannot be cancelled.
++    }
++    handle = null;
++    try {
++      handle = WebOsLunaService.subscribe(`luna://${serviceId}`, {
++        method,
++        parameters,
++        onSuccess: (payload) => {
++          if (closed || currentGeneration !== generation) return;
++          failures = 0;
++          if (retryTimer) {
++            clearTimeout(retryTimer);
++            retryTimer = null;
++          }
++          onSuccess?.(payload);
++        },
++        onFailure: (error) => {
++          if (closed || currentGeneration !== generation) return;
++          scheduleRetry();
++          onFailure?.(error);
++        }
++      });
++    } catch (error) {
++      if (!recoverable) throw error;
++      scheduleRetry();
++      onFailure?.(error);
++    }
++  };
++
++  connect();
++  return {
++    cancel() {
++      closed = true;
++      generation += 1;
++      if (retryTimer) clearTimeout(retryTimer);
++      retryTimer = null;
++      try {
++        handle?.cancel?.();
++      } catch (_) {
++        // Ignore cancellation failures during route cleanup.
++      }
++      handle = null;
++    }
++  };
+ }
+--- a/js/core/p2p/webOsEngineFsResolverMethods-02-resolve.js
++++ b/js/core/p2p/webOsEngineFsResolverMethods-02-resolve.js
+@@ -17,3 +17,2 @@
+     buildPlaybackUrl,
+-    withTimeout,
+     describeError,
+@@ -62,8 +62,12 @@
+         try {
+-          const statusResult = await withTimeout(
+-            requestWebOsCompanionService({ method: "status", parameters: {}, timeoutMs: 5000 }),
+-            5000,
+-            "webOS companion status request timed out"
+-          );
++          // The Luna client already retries a failed status request once.
++          // The old 5s outer timeout aborted before that recovery could run,
++          // especially while the companion was booting on older LG TVs.
++          // Bound each of the two attempts instead (at most ~14s total).
++          const statusResult = await requestWebOsCompanionService({
++            method: "status",
++            parameters: {},
++            timeoutMs: 7000
++          });
+           statusPayload = statusResult?.payload || {};
+         } catch (error) {
+--- /dev/null
++++ b/js/platform/webos/webosCompanionService.test.mjs
+@@ -0,0 +1,74 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { requestWebOsCompanionService, subscribeWebOsCompanionService } from "./webosCompanionService.js";
++const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++
++function mockBridge(t, onRequest) {
++  const oldWebOS = globalThis.webOS;
++  globalThis.webOS = { service: { request: (_url, args) => onRequest(args) } };
++  t.after(() => { globalThis.webOS = oldWebOS; });
++}
++
++test("status retry succeeds after initial companion failure", async (t) => {
++  let count = 0;
++  mockBridge(t, (args) => {
++    count += 1;
++    if (count === 1) queueMicrotask(() => args.onFailure({ errorText: "service not running" }));
++    else queueMicrotask(() => args.onSuccess({ returnValue: true, booted: true, url: "http://127.0.0.1:2710" }));
++    return { cancel() {} };
++  });
++  const result = await requestWebOsCompanionService({ method: "status", timeoutMs: 7000 });
++  assert.equal(count, 2);
++  assert.equal(result.payload.booted, true);
++});
++
++test("enginefsKeepAlive reconnects and cancel stops future retries", async (t) => {
++  let calls = 0;
++  let latest;
++  mockBridge(t, (args) => {
++    calls += 1;
++    latest = args;
++    if (calls === 1) queueMicrotask(() => args.onFailure({ errorText: "evicted" }));
++    else queueMicrotask(() => args.onSuccess({ returnValue: true }));
++    return { cancel() {} };
++  });
++  let successes = 0;
++  const subscription = subscribeWebOsCompanionService({
++    method: "enginefsKeepAlive",
++    onSuccess: () => { successes += 1; }
++  });
++  await delay(350);
++  assert.equal(calls, 2);
++  assert.equal(successes, 1);
++  subscription.cancel();
++  latest.onFailure({ errorText: "after cancel" });
++  await delay(350);
++  assert.equal(calls, 2);
++});
++
++test("cancel before a scheduled retry does not resubscribe", async (t) => {
++  let calls = 0;
++  mockBridge(t, (args) => {
++    calls += 1;
++    queueMicrotask(() => args.onFailure({ errorText: "evicted" }));
++    return { cancel() {} };
++  });
++  const subscription = subscribeWebOsCompanionService({ method: "enginefsKeepAlive" });
++  await delay(15);
++  subscription.cancel();
++  await delay(350);
++  assert.equal(calls, 1);
++});
++
++test("non-keepalive subscriptions are not reconnected", async (t) => {
++  let calls = 0;
++  mockBridge(t, (args) => {
++    calls += 1;
++    queueMicrotask(() => args.onFailure({ errorText: "failed" }));
++    return { cancel() {} };
++  });
++  const subscription = subscribeWebOsCompanionService({ method: "somethingElse" });
++  await delay(350);
++  subscription.cancel();
++  assert.equal(calls, 1);
++});

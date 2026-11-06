@@ -1,0 +1,144 @@
+diff --git a/js/ui/screens/home/homeScreenMethods-18-focus-node.js b/js/ui/screens/home/homeScreenMethods-18-focus-node.js
+--- a/js/ui/screens/home/homeScreenMethods-18-focus-node.js
++++ b/js/ui/screens/home/homeScreenMethods-18-focus-node.js
+@@ -1,7 +1,7 @@
+ import * as internals from "./homeScreenContext.js";
+ 
+ export function createHomeScreenMethods18() {
+-  const { HOME_PERF_DEBUG, homePerfNow, logHomePerf, groupNodesByOffsetTop } = internals;
++  const { HOME_PERF_DEBUG, homePerfNow, logHomePerf, groupNodesByOffsetTop, Router } = internals;
+ 
+   return {
+     focusNode(current, target, direction = null, inputMeta = null) {
+@@ -24,6 +24,7 @@
+       target.classList.add("focused");
+       this.focusWithoutAutoScroll(target, { suppressDelegatedFocus: true });
+       this.setCurrentFocusedNode(target);
++      this.scheduleC1NextRowPrefetch(target, direction);
+       this.scheduleHomeLazyImageHydration(target, {
+         deferUntilVerticalSettle: direction === "up" || direction === "down",
+         focusedRowOnly: this.isLegacyTvRuntime()
+@@ -75,5 +75,47 @@
+       });
+       return true;
++    },
++    scheduleC1NextRowPrefetch(anchor, direction) {
++      if (this.c1NextRowTimer) {
++        clearTimeout(this.c1NextRowTimer);
++        this.c1NextRowTimer = null;
++      }
++      // Do no image work on the D-pad hot path. Prefetch only after the
++      // remote and vertical camera have been idle for at least 450 ms.
++      if (
++        this.layoutMode !== "modern" ||
++        !this.shouldUseBoundedHomeImageHydration() ||
++        !this.isMainNode(anchor)
++      ) {
++        return;
++      }
++      const rowIndex = Number(anchor.dataset.navRow);
++      const columnIndex = Number(anchor.dataset.navCol);
++      if (!Number.isInteger(rowIndex) || !Number.isInteger(columnIndex)) return;
++      const neighborIndex = rowIndex + (direction === "up" ? -1 : 1);
++      this.c1NextRowTimer = setTimeout(() => {
++        this.c1NextRowTimer = null;
++        if (
++          Router.getCurrent() !== "home" ||
++          this.getCurrentFocusedNode() !== anchor ||
++          this.isSidebarFocusActive?.() ||
++          this.modernVerticalFastScrollState ||
++          this.isModernVerticalScrollActive?.()
++        ) return;
++        const nodes = this.navModel?.rows?.[neighborIndex] || [];
++        const candidates = [nodes[columnIndex], nodes[columnIndex + 1], nodes[columnIndex - 1], nodes[0]];
++        const seen = new Set();
++        let warmed = 0;
++        for (const card of candidates) {
++          if (!card || seen.has(card)) continue;
++          seen.add(card);
++          const image = card.querySelector?.(".content-poster[data-src]");
++          const src = String(image?.dataset?.src || "").trim();
++          if (!src || !image.isConnected) continue;
++          this.assignHomeLazyImageSource(image, src, 2);
++          if (++warmed >= 2) break;
++        }
++      }, 450);
+     },
+     buildNavigationModel() {
+       const sidebar = this.layoutPrefs?.modernSidebar
+diff --git a/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js b/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js
+--- a/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js
++++ b/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js
+@@ -308,5 +308,19 @@
+     },
+     assignHomeLazyImageSource(image, src, priority = 2) {
++      // Fade only for new src assignments. No replay when focus changes.
++      if (image.classList.contains("content-poster") && !image.getAttribute("src")) {
++        image.c1FinishPosterFade?.();
++        image.classList.add("c1-poster-loading");
++        const finish = () => {
++          image.removeEventListener("load", finish);
++          image.removeEventListener("error", finish);
++          image.classList.remove("c1-poster-loading");
++          if (image.c1FinishPosterFade === finish) image.c1FinishPosterFade = null;
++        };
++        image.c1FinishPosterFade = finish;
++        image.addEventListener("load", finish);
++        image.addEventListener("error", finish);
++      }
+       // The app already decided this image is close enough to load, so stop
+       // deferring to the browser's own lazy heuristic.
+       image.loading = "eager";
+diff --git a/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js b/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js
+--- a/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js
++++ b/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js
+@@ -298,6 +298,12 @@
+         this.pendingEpisodeSelection ||
+         this.pendingMovieSelection ||
+         this.shouldSuppressTrailerAutoplay() ||
++        // On constrained LG webOS, auto-embedded YouTube trailers can show
++        // "Video player configuration error" while idle. Keep static artwork;
++        // manual trailer selection remains available.
++        (globalThis.__NUVIO_PLATFORM__ === "webos" &&
++          this.isPerformanceConstrained() &&
++          this.trailerSource.kind === "youtube") ||
+         !PlayerSettingsStore.get().trailerAutoplay
+       ) {
+         return;
+diff --git a/css/components-61.css b/css/components-61.css
+--- a/css/components-61.css
++++ b/css/components-61.css
+@@ -194,3 +194,33 @@
+   text-align: center;
+   pointer-events: none;
+ }
++
++/* C1 polish: two static rings, not an expensive animated blur. */
++.performance-constrained .home-screen-shell .home-poster-card.focused .home-poster-frame {
++  box-shadow: 0 0 0 2px var(--secondary-color), 0 0 0 6px rgb(var(--secondary-color-rgb) / 0.22) !important;
++}
++
++/* Loaded posters fade into place without animating layout or scroll. */
++.performance-constrained .home-screen-shell .home-poster-card .content-poster {
++  transition: opacity 190ms ease-out !important;
++}
++.performance-constrained .home-screen-shell .home-poster-card .content-poster.c1-poster-loading {
++  opacity: 0 !important;
++}
++
++/* Prevent detail action edges and focus indications being cropped. */
++.series-detail-actions {
++  overflow: visible;
++  padding-top: 10px;
++  padding-bottom: 10px;
++}
++.series-detail-actions .series-primary-btn,
++.series-detail-actions .series-circle-btn {
++  box-sizing: border-box;
++  flex-shrink: 0;
++}
++@media (prefers-reduced-motion: reduce) {
++  .performance-constrained .home-screen-shell .home-poster-card .content-poster {
++    transition: none !important;
++  }
++}

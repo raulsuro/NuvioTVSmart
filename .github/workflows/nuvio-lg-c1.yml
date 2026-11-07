@@ -96,6 +96,16 @@ jobs:
           cache: npm
           cache-dependency-path: nuvio/package-lock.json
 
+      - name: Apply login recovery (QR/manual/Back)
+        if: steps.existing.outputs.skip != 'true'
+        working-directory: nuvio
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/custom/custom-patches/apply_login_recovery.py"
+          node --check js/ui/screens/account/authQrSignInScreenMethods-02-bind-controls.js
+          node --check js/ui/screens/account/authQrSignInScreenMethods-03-to-friendly-email-error.js
+          git diff --check
       - name: Install dependencies
         if: steps.existing.outputs.skip != 'true'
         working-directory: nuvio
@@ -145,8 +155,45 @@ jobs:
 
           # Package the patched build without regenerating the env.
           node ./scripts/package-webos.mjs
-          test -f "space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk"
-          sha256sum "space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk" > checksums.sha256
+
+          # Verify the FINAL IPK, not just dist/. Fail safely if login breaks.
+          BUILT_IPK="space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk"
+          test -f "$BUILT_IPK"
+          BUILT_DATA="$(ar t "$BUILT_IPK" | grep '^data\.tar' | head -n 1)"
+          test -n "$BUILT_DATA" || { echo "::error::Built IPK has no data archive"; exit 1; }
+          mkdir -p package-check
+          ar p "$BUILT_IPK" "$BUILT_DATA" > "package-check/$BUILT_DATA"
+          BUILT_TAR="package-check/$BUILT_DATA"
+          tar -tf "$BUILT_TAR" > package-check/contents.txt
+
+          for name in nuvio.env.js app.bundle.js assets/libs/qrcode-generator.js; do
+            grep -Eq "(^|/)${name//./[.]}$" package-check/contents.txt || {
+              echo "::error::Final IPK missing $name"
+              exit 1
+            }
+          done
+          ENV_PATH="$(grep -E '(^|/)nuvio\.env\.js$' package-check/contents.txt | head -n 1)"
+          tar -xOf "$BUILT_TAR" "$ENV_PATH" | node -e '
+            const vm = require("vm");
+            let source = "";
+            process.stdin.on("data", chunk => source += chunk);
+            process.stdin.on("end", () => {
+              const sandbox = {};
+              vm.runInNewContext(source, sandbox);
+              const env = sandbox.__NUVIO_ENV__ || {};
+              if (!env.NUVIO_SUPABASE_URL || !env.NUVIO_SUPABASE_ANON_KEY || !env.DEVICE_LOGIN_WEB_BASE_URL) {
+                console.error("Final IPK is missing required QR authentication configuration");
+                process.exit(1);
+              }
+              console.log("Final IPK authentication configuration validated (values hidden)");
+            });
+          '
+          QR_PATH="$(grep -E '(^|/)assets/libs/qrcode-generator\.js$' package-check/contents.txt | head -n 1)"
+          test "$(tar -xOf "$BUILT_TAR" "$QR_PATH" | wc -c)" -gt 2000 || {
+            echo "::error::QR library missing or truncated"
+            exit 1
+          }
+          sha256sum "$BUILT_IPK" > checksums.sha256
 
       - name: Upload IPK as build artifact
         if: steps.existing.outputs.skip != 'true'

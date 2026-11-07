@@ -119,7 +119,32 @@ jobs:
         run: |
           set -euo pipefail
           npm run lint:runtime
-          npm run package:webos
+          # Build our patched code first.
+          npm run build
+
+          # Retrieve the configured runtime from the matching
+          # official Nuvio release. Never print its contents.
+          TAG="${{ steps.version.outputs.tag }}"
+          mkdir -p official-ipk
+          GH_TOKEN="${{ github.token }}" gh release download "$TAG" \
+            --repo NuvioMedia/NuvioTVSmart \
+            --pattern "NuvioTV-webOS-${TAG}.ipk" \
+            --dir official-ipk
+
+          IPK="official-ipk/NuvioTV-webOS-${TAG}.ipk"
+          DATA="$(ar t "$IPK" | grep '^data\.tar' | head -n 1)"
+          test -n "$DATA" || { echo "Official IPK archive missing"; exit 1; }
+          ar p "$IPK" "$DATA" > "official-ipk/$DATA"
+
+          ENV_PATH="$(tar -tf "official-ipk/$DATA" | grep -E '(^|/)nuvio\.env\.js$' | head -n 1)"
+          test -n "$ENV_PATH" || { echo "Runtime config missing"; exit 1; }
+          tar -xOf "official-ipk/$DATA" "$ENV_PATH" > dist/nuvio.env.js
+
+          # Validate required settings without exposing their values.
+          node -e 'const fs=require("fs"),vm=require("vm"),s={};vm.runInNewContext(fs.readFileSync("dist/nuvio.env.js","utf8"),s);if(!s.__NUVIO_ENV__?.NUVIO_SUPABASE_URL||!s.__NUVIO_ENV__?.NUVIO_SUPABASE_ANON_KEY)process.exit(1)'
+
+          # Package the patched build without regenerating the env.
+          node ./scripts/package-webos.mjs
           test -f "space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk"
           sha256sum "space.nuvio.webos_${{ steps.version.outputs.tag }}_all.ipk" > checksums.sha256
 

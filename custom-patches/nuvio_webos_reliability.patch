@@ -92,30 +92,6 @@
 +    }
 +  };
  }
---- a/js/core/p2p/webOsEngineFsResolverMethods-02-resolve.js
-+++ b/js/core/p2p/webOsEngineFsResolverMethods-02-resolve.js
-@@ -17,3 +17,2 @@
-     buildPlaybackUrl,
--    withTimeout,
-     describeError,
-@@ -62,8 +62,12 @@
-         try {
--          const statusResult = await withTimeout(
--            requestWebOsCompanionService({ method: "status", parameters: {}, timeoutMs: 5000 }),
--            5000,
--            "webOS companion status request timed out"
--          );
-+          // The Luna client already retries a failed status request once.
-+          // The old 5s outer timeout aborted before that recovery could run,
-+          // especially while the companion was booting on older LG TVs.
-+          // Bound each of the two attempts instead (at most ~14s total).
-+          const statusResult = await requestWebOsCompanionService({
-+            method: "status",
-+            parameters: {},
-+            timeoutMs: 7000
-+          });
-           statusPayload = statusResult?.payload || {};
-         } catch (error) {
 --- /dev/null
 +++ b/js/platform/webos/webosCompanionService.test.mjs
 @@ -0,0 +1,74 @@

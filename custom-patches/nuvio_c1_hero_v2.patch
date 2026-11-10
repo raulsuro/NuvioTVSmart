@@ -1,10 +1,10 @@
 diff --git a/css/components-64.css b/css/components-64.css
 --- a/css/components-64.css
 +++ b/css/components-64.css
-@@ -48,3 +48,27 @@
+@@ -47,3 +47,27 @@
+ .settings-action-row.settings-info-row .settings-row-value {
    font-weight: 600;
  }
- 
 +
 +
 +/* C1 Turbo hero: preserve available copy while focus/metadata settles.

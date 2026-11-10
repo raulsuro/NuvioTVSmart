@@ -81,7 +81,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in nuvio_webos_reliability.patch nuvio_webos_ui_performance.patch nuvio_home_performance_v2.patch nuvio_c1_polish_v2.patch; do
+          for p in nuvio_webos_reliability.patch nuvio_webos_ui_performance.patch nuvio_home_performance_v2.patch nuvio_c1_polish_v2.patch nuvio_c1_turbo_v1.patch; do
             echo "Checking and applying $p"
             git apply --check "$GITHUB_WORKSPACE/custom/custom-patches/$p"
             git apply "$GITHUB_WORKSPACE/custom/custom-patches/$p"

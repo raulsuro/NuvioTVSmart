@@ -1,0 +1,71 @@
+diff --git a/js/app.js b/js/app.js
+--- a/js/app.js
++++ b/js/app.js
+@@ -274,6 +274,10 @@
+   );
+   document.body.classList.toggle("modern-sidebar-blur-capable", modernSidebarBlurCapable);
+   document.documentElement.classList.toggle("legacy-webos", legacyWebOs);
++  // Experimental C1 layout retention. Other platforms keep upstream defaults.
++  const c1FastReturn = Platform.isWebOS() && tvRuntime.tvYear === 2021 &&
++    tvRuntime.chromiumMajorVersion <= 79;
++  document.documentElement.classList.toggle("webos-2021-fast-resume", c1FastReturn);
+   document.body.classList.toggle("legacy-webos", legacyWebOs);
+   document.documentElement.classList.toggle("webos-unpromoted-home-tracks", unpromotedHomeTracks);
+   document.body.classList.toggle("webos-unpromoted-home-tracks", unpromotedHomeTracks);
+diff --git a/css/components-07.css b/css/components-07.css
+--- a/css/components-07.css
++++ b/css/components-07.css
+@@ -582,6 +582,27 @@
+   }
+ }
+ 
++/* LG 2021 webOS 6 (Chromium 79) lacks content-visibility. Experimental:
++   keep Home laid out between routes so return doesn't relayout every row.
++   It remains hidden/off-screen with pointer events disabled. */
++@supports not (content-visibility: hidden) {
++  :root.webos-2021-fast-resume #home.home-dom-preserved {
++    display: block !important;
++    visibility: hidden !important;
++    pointer-events: none !important;
++  }
++}
++
++/* Instant poster reveal on the C1. Do not animate every decoded bitmap.
++   The custom polish may still attach load listeners; these rules avoid the
++   expensive opacity animation and the extra visual delay. */
++:root.webos-2021-fast-resume.performance-constrained .home-screen-shell .home-poster-card .content-poster {
++  transition: none !important;
++}
++:root.webos-2021-fast-resume.performance-constrained .home-screen-shell .home-poster-card .content-poster.c1-poster-loading {
++  opacity: 1 !important;
++}
++
+ #home.home-dom-preserved .root-sidebar-legacy,
+ #home.home-dom-preserved .modern-sidebar-shell {
+   display: none !important;
+diff --git a/js/ui/screens/home/homeScreenMethods-04-get-hero-focus-delay.js b/js/ui/screens/home/homeScreenMethods-04-get-hero-focus-delay.js
+--- a/js/ui/screens/home/homeScreenMethods-04-get-hero-focus-delay.js
++++ b/js/ui/screens/home/homeScreenMethods-04-get-hero-focus-delay.js
+@@ -469,6 +469,22 @@
+       ]);
+     },
+     async refreshHomeAfterRouteReturn({ preserveReturnState = true, reason = "route-return" } = {}) {
++      const runtime = getTvRuntimePerformanceProfile();
++      if (reason === "route-resume" && runtime.platform === "webos" && runtime.tvYear === 2021) {
++        const token = this.homeLoadToken;
++        const startedAt = Date.now();
++        await new Promise((resolve) => setTimeout(resolve, 450));
++        while (
++          Date.now() - Number(this.lastHomeInputAt || 0) < 650 &&
++          Date.now() - startedAt < 2000 &&
++          token === this.homeLoadToken &&
++          Router.getCurrent() === "home"
++        ) {
++          await new Promise((resolve) => setTimeout(resolve, 150));
++        }
++        // A route or profile change during the pause must cancel stale work.
++        if (token !== this.homeLoadToken || Router.getCurrent() !== "home") return false;
++      }
+       // Android retains Home's rows on resume. Rebuild only for changed inputs
+       // or an interrupted catalog load; otherwise reconcile watch state and
+       // merge catalog page one only after the shared freshness window expires.

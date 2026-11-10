@@ -1,0 +1,223 @@
+diff --git a/css/components-64.css b/css/components-64.css
+--- a/css/components-64.css
++++ b/css/components-64.css
+@@ -48,3 +48,27 @@
+   font-weight: 600;
+ }
+ 
++
++
++/* C1 Turbo hero: preserve available copy while focus/metadata settles.
++   Do not override opacity: trailer playback still controls its visibility. */
++:root.webos-2021-fast-resume .home-screen-shell.home-layout-modern .home-modern-hero-copy {
++  visibility: visible !important;
++}
++
++:root.webos-2021-fast-resume .home-screen-shell .home-modern-hero-copy,
++:root.webos-2021-fast-resume .home-screen-shell .home-modern-hero-copy *,
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-backdrop,
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-logo {
++  transition: none !important;
++}
++
++/* Only neutralize the enter state; preserve trailer-driven opacity rules. */
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-logo.home-hero-logo-transition-enter {
++  opacity: 1;
++}
++
++/* Avoid filtering the large backdrop on each repaint on Chromium 79. */
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-backdrop {
++  filter: none !important;
++}
+diff --git a/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js b/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js
+--- a/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js
++++ b/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js
+@@ -236,6 +236,21 @@
+     return;
+   }
+ 
++  // C1: retain the current bitmap until ready, then swap without a fade,
++  // extra compositor layer, forced layout, or animation-frame delay.
++  if (transitionMode === "instant") {
++    preloadImageSource(normalizedSrc).then(() => {
++      if (Number(backdrop.heroBackdropTransitionToken || 0) !== token) {
++        return;
++      }
++      finalize();
++      backdrop.setAttribute("src", normalizedSrc);
++      backdrop.setAttribute("alt", normalizedAlt);
++      backdrop.classList.remove("placeholder");
++    });
++    return;
++  }
++
+   if (transitionMode === "single-layer") {
+     preloadImageSource(normalizedSrc).then((loaded) => {
+       if (Number(backdrop.heroBackdropTransitionToken || 0) !== token) {
+diff --git a/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js b/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js
+--- a/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js
++++ b/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js
+@@ -225,6 +225,20 @@
+     return;
+   }
+ 
++  // C1: retain the current bitmap until ready, then swap without a fade,
++  // extra compositor layer, forced layout, or animation-frame delay.
++  if (transitionMode === "instant") {
++    preloadImageSource(normalizedSrc).then(() => {
++      if (Number(logoNode.heroLogoTransitionToken || 0) !== token) {
++        return;
++      }
++      finalize();
++      logoNode.setAttribute("src", normalizedSrc);
++      logoNode.setAttribute("alt", normalizedAlt);
++    });
++    return;
++  }
++
+   if (transitionMode === "single-layer") {
+     preloadImageSource(normalizedSrc).then((loaded) => {
+       if (Number(logoNode.heroLogoTransitionToken || 0) !== token) {
+diff --git a/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js b/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
+--- a/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
++++ b/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
+@@ -46,13 +46,14 @@
+       heroNode.classList.remove("is-hero-focus-pending");
+       const heroCrossfadeMs =
+         this.layoutMode === "modern" ? HOME_MODERN_HERO_BACKDROP_CROSSFADE_MS : HOME_LEGACY_HERO_BACKDROP_CROSSFADE_MS;
+-      const heroTransitionMode = getTvHeroTransitionMode();
++      const c1FastHero = document.documentElement.classList.contains("webos-2021-fast-resume");
++      const heroTransitionMode = c1FastHero ? "instant" : getTvHeroTransitionMode();
+ 
+       const backdrop = heroNode.querySelector(".home-hero-backdrop:not(.home-hero-backdrop-transition-ghost)");
+       if (backdrop) {
+         const src = display.backdrop || "";
+         if (backdrop instanceof HTMLImageElement) {
+-          const shouldFreezeBackdrop = Boolean(hero?.heroMetaEnriching) && String(backdrop.getAttribute("src") || "").trim();
++          const shouldFreezeBackdrop = (!c1FastHero || !src) && Boolean(hero?.heroMetaEnriching) && String(backdrop.getAttribute("src") || "").trim();
+           if (!shouldFreezeBackdrop) {
+             animateHeroBackdropSwap(backdrop, src, display.title || "featured", heroCrossfadeMs, {
+               transitionMode: heroTransitionMode
+@@ -97,7 +98,8 @@
+ 
+       const titleNode = heroNode.querySelector(".home-hero-title-text");
+       if (titleNode) {
+-        titleNode.textContent = display.title || "Untitled";
++        const nextTitle = display.title || "Untitled";
++        if (!c1FastHero || titleNode.textContent !== nextTitle) titleNode.textContent = nextTitle;
+         titleNode.classList.toggle("is-hidden", Boolean(display.logo));
+       }
+ 
+@@ -142,7 +144,8 @@
+ 
+       const descriptionNode = heroNode.querySelector(".home-hero-description");
+       if (descriptionNode) {
+-        descriptionNode.textContent = display.description || " ";
++        const nextDescription = display.description || " ";
++        if (!c1FastHero || descriptionNode.textContent !== nextDescription) descriptionNode.textContent = nextDescription;
+         descriptionNode.classList.toggle("is-empty", !display.description);
+       }
+       const mdbRow = heroNode.querySelector(".home-hero-mdb-ratings");
+diff --git a/scripts/test-c1-hero-turbo.mjs b/scripts/test-c1-hero-turbo.mjs
+new file mode 100644
+--- /dev/null
++++ b/scripts/test-c1-hero-turbo.mjs
+@@ -0,0 +1,98 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++
++const root = process.env.HERO_SOURCE || '.';
++function fixture(kind) {
++  const file = kind === 'backdrop' ? '03-animate-hero-backdrop-swap' : '04-animate-hero-logo-swap';
++  const source = fs.readFileSync(`${root}/js/ui/screens/home/homeScreenHelpers-${file}.js`, 'utf8');
++  const pending = [];
++  const frames = [];
++  let ghosts = 0;
++  let enters = 0;
++  class Img {
++    constructor() {
++      this.attrs = { src: 'old' };
++      const classes = new Set();
++      this.classList = { add: (...xs) => xs.forEach(x => classes.add(x)), remove: (...xs) => xs.forEach(x => classes.delete(x)), contains: x => classes.has(x) };
++      this.parentElement = { querySelectorAll: () => [], insertBefore: () => ghosts++ };
++    }
++    getAttribute(k) { return this.attrs[k]; }
++    setAttribute(k, v) { this.attrs[k] = v; }
++    removeAttribute(k) { delete this.attrs[k]; }
++    remove() { this.removed = true; }
++    cloneNode() { return new Img(); }
++  }
++  const ctx = vm.createContext({ HTMLImageElement: Img, HOME_MODERN_HERO_BACKDROP_CROSSFADE_MS: 400,
++    preloadImageSource: src => new Promise(resolve => pending.push({ src, resolve })),
++    prepareHeroImageEnter: () => enters++, requestAnimationFrame: fn => frames.push(fn), setTimeout: () => {} });
++  vm.runInContext(source.replace(/^import [\s\S]*?;\s*/gm, '').replaceAll('export function', 'function'), ctx);
++  const fn = ctx[kind === 'backdrop' ? 'animateHeroBackdropSwap' : 'animateHeroLogoSwap'];
++  return { img: new Img(), pending, frames, swap: fn, ghosts: () => ghosts, enters: () => enters };
++}
++test('C1 starts available backdrop during metadata enrichment; other TVs retain upstream behavior', () => {
++  const source = fs.readFileSync(`${root}/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js`, 'utf8');
++  for (const isC1 of [true, false]) {
++    const f = fixture('backdrop');
++    const swaps = [];
++    const heroNode = {
++      dataset: {}, classList: { toggle() {}, remove() {} },
++      querySelector: selector => selector.startsWith('.home-hero-backdrop:') ? f.img : null,
++      querySelectorAll: () => []
++    };
++    const ctx = vm.createContext({
++      document: { documentElement: { classList: { contains: () => isC1 } } },
++      HTMLImageElement: f.img.constructor,
++      ensureHeroMdbListRatings() {}, registerHomeDomNodes() {},
++      internals: {
++        getTvHeroTransitionMode: () => 'single-layer',
++        buildModernHeroPresentation: () => ({ backdrop: 'new', title: 'New title' }),
++        animateHeroBackdropSwap: (...args) => swaps.push(args)
++      }
++    });
++    vm.runInContext(source.replace(/^import [\s\S]*?;\s*/gm, '').replace('export function', 'function'), ctx);
++    const screen = {
++      container: { querySelector: () => heroNode },
++      heroItem: { id: 'new', heroMetaEnriching: true }, layoutMode: 'modern',
++      scheduleHomeTruncationUpdate() {}, syncCollectionHeroMedia() {}, applyHeroDescriptionAutoScroll() {}
++    };
++    ctx.createHomeScreenMethods05().applyHeroToDom.call(screen);
++    assert.equal(swaps.length, isC1 ? 1 : 0);
++    if (isC1) assert.equal(swaps[0][4].transitionMode, 'instant');
++  }
++});
++for (const kind of ['backdrop', 'logo']) {
++  test(`${kind}: instant swap retains old image until loaded, without fades or clones`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'new', 'Title', 400, { transitionMode: 'instant' });
++    assert.equal(f.img.attrs.src, 'old');
++    f.pending[0].resolve(true); await Promise.resolve();
++    assert.equal(f.img.attrs.src, 'new');
++    assert.equal(f.frames.length, 0);
++    assert.equal(f.ghosts(), 0);
++    assert.equal(f.enters(), 0);
++  });
++  test(`${kind}: stale load cannot replace newer selection`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'stale', '', 400, { transitionMode: 'instant' });
++    f.swap(f.img, 'latest', '', 400, { transitionMode: 'instant' });
++    f.pending[1].resolve(true); await Promise.resolve();
++    f.pending[0].resolve(true); await Promise.resolve();
++    assert.equal(f.img.attrs.src, 'latest');
++  });
++  test(`${kind}: failed preload still delegates to image fallback`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'failed', '', 400, { transitionMode: 'instant' });
++    f.pending[0].resolve(false); await Promise.resolve();
++    assert.equal(f.img.attrs.src, 'failed');
++  });
++  test(`${kind}: normal crossfade is preserved`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'new');
++    f.pending[0].resolve(true); await Promise.resolve();
++    assert.equal(f.ghosts(), 1);
++    assert.equal(f.enters(), 1);
++    assert.equal(f.frames.length, 1);
++  });
++}

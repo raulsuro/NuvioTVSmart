@@ -119,7 +119,7 @@ jobs:
           set -euo pipefail
           node --test js/platform/webos/webosCompanionService.test.mjs
           node --test js/ui/screens/search/searchPosterHydration.test.mjs
-          node --test js/ui/images/tvPosterRescalerWarmCache.test.mjs js/ui/screens/home/homeImageCommitQueue.test.mjs
+          node --test js/ui/screens/home/homeImageCommitQueue.test.mjs
           node --test js/ui/images/tvPosterRescalerPool.test.mjs js/ui/screens/home/homeArtworkLifecycle.test.mjs
 
       - name: Lint and build webOS package

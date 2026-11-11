@@ -1,0 +1,234 @@
+--- a/js/ui/screens/home/homeScreenMethods-23-render.js
++++ b/js/ui/screens/home/homeScreenMethods-23-render.js
+@@ -48,12 +48,13 @@
+       if (this.hasUserInteractedSinceHomePaint) {
+         this.forceInitialContinueWatchingFocus = false;
+       }
++      const c1Fast = globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume");
+       const canUpdateInPlace = Boolean(
+         hasMountedHomeDom(this.container) &&
+         this.renderedLayoutMode === this.layoutMode &&
+-        !this.homeRouteEnterPending &&
+-        !this.isRestoringFocusFromBack &&
+-        !this.pendingBackFocusState
++        (c1Fast || (!this.homeRouteEnterPending &&
++          !this.isRestoringFocusFromBack &&
++          !this.pendingBackFocusState))
+       );
+       this.teardownModernTrackScrollPagination();
+       this.teardownContinueWatchingProgressiveRendering();
+@@ -329,6 +330,8 @@
+         });
+       }
+       const focusSurvived = Boolean(
++        !this.isRestoringFocusFromBack &&
++        !this.pendingBackFocusState &&
+         updatedInPlace &&
+         liveFocusedNode?.isConnected &&
+         this.container.contains(liveFocusedNode) &&
+--- a/js/ui/screens/settings/settingsScreenMethods-01-get-current-rail-scroll-top.js
++++ b/js/ui/screens/settings/settingsScreenMethods-01-get-current-rail-scroll-top.js
+@@ -316,12 +316,12 @@
+           }
+         });
+     },
+-    renderNav() {
++    renderNav({ includeSelection = true } = {}) {
+       return this.visibleSections
+         .map(
+           (item, index) => `
+-          <button class="settings-nav-item focusable${this.activeSection === item.id ? " selected" : ""}"
+-                  data-zone="nav" role="tab" aria-selected="${this.activeSection === item.id ? "true" : "false"}"
++          <button class="settings-nav-item focusable${includeSelection && this.activeSection === item.id ? " selected" : ""}"
++                  data-zone="nav" role="tab" aria-selected="${includeSelection && this.activeSection === item.id ? "true" : "false"}"
+                   data-nav-index="${index}"
+                   data-focus-key="nav:${item.id}"
+                   data-section="${item.id}">
+--- a/js/ui/screens/settings/settingsScreenMethods-12-render-trakt-stats-strip.js
++++ b/js/ui/screens/settings/settingsScreenMethods-12-render-trakt-stats-strip.js
+@@ -241,6 +241,7 @@
+       const contentSlot = this.container.querySelector("[data-settings-content]");
+       const dialogSlot = this.container.querySelector("[data-settings-dialog]");
+ 
++      const c1Fast = globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume");
+       const rootSidebarHtml = renderRootSidebar({
+         selectedRoute: "settings",
+         profile: this.sidebarProfile,
+@@ -248,13 +249,28 @@
+         expanded: Boolean(this.sidebarExpanded),
+         pillIconOnly: Boolean(this.pillIconOnly)
+       });
+-      if (rootSidebarSlot && rootSidebarSlot.innerHTML !== rootSidebarHtml) {
++      if (rootSidebarSlot && (c1Fast
++        ? this.c1RootSidebarSlot !== rootSidebarSlot || !rootSidebarSlot.firstElementChild || this.c1RootSidebarHtml !== rootSidebarHtml
++        : rootSidebarSlot.innerHTML !== rootSidebarHtml)) {
+         rootSidebarSlot.innerHTML = rootSidebarHtml;
+-      }
+-
+-      const navHtml = this.renderNav();
+-      if (navSlot && navSlot.innerHTML !== navHtml) {
++        this.c1RootSidebarSlot = rootSidebarSlot;
++        this.c1RootSidebarHtml = rootSidebarHtml;
++      }
++
++      const navHtml = this.renderNav({ includeSelection: !c1Fast });
++      if (navSlot && (c1Fast
++        ? this.c1NavSlot !== navSlot || !navSlot.firstElementChild || this.c1NavHtml !== navHtml
++        : navSlot.innerHTML !== navHtml)) {
+         navSlot.innerHTML = navHtml;
++        this.c1NavSlot = navSlot;
++        this.c1NavHtml = navHtml;
++      }
++      if (c1Fast && navSlot) {
++        navSlot.querySelectorAll(".settings-nav-item").forEach((node) => {
++          const selected = node.dataset.section === this.activeSection;
++          node.classList.toggle("selected", selected);
++          node.setAttribute("aria-selected", String(selected));
++        });
+       }
+       if (navSlot && this.railScrollNode !== navSlot) {
+         if (this.railScrollNode && this.handleRailScrollBound) {
+@@ -295,7 +311,7 @@
+           if (previousScrollState) {
+             restoreSettingsScrollState(contentSlot, previousScrollState);
+           }
+-          if (sectionChanged) {
++          if (sectionChanged && !c1Fast) {
+             contentSlot.classList.remove("is-section-transitioning");
+             if (hadContent) {
+               // Restart the transition on reused content; new content animates anyway.
+--- a/js/ui/screens/settings/settingsScreenHelpers-09-update-settings-marquee-targets.js
++++ b/js/ui/screens/settings/settingsScreenHelpers-09-update-settings-marquee-targets.js
+@@ -263,6 +263,11 @@
+   };
+ 
+   const startPosition = readPosition();
++  if (globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume")) {
++    writePosition(nextPosition);
++    updateSettingsRailIndicators(rail);
++    return;
++  }
+   if (Math.abs(nextPosition - startPosition) < 1 || typeof requestAnimationFrame !== "function") {
+     writePosition(nextPosition);
+     updateSettingsRailIndicators(rail);
+--- /dev/null
++++ b/scripts/test-c1-home-return.mjs
+@@ -0,0 +1,28 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++const source = fs.readFileSync('js/ui/screens/home/homeScreenMethods-23-render.js', 'utf8');
++function decision(name, state, c1 = true, mounted = true) {
++  const expression = source.match(new RegExp('const ' + name + ' = (Boolean\\([\\s\\S]*?\\n      \\));'))?.[1];
++  assert.ok(expression, name + ' declaration');
++  const context = vm.createContext({ state, c1Fast: c1, hasMountedHomeDom: () => mounted,
++    updatedInPlace: true, liveFocusedNode: { isConnected: true, classList: { contains: () => true } } });
++  return vm.runInContext('(function(){ return ' + expression + '; }).call(state)', context);
++}
++const state = () => ({ container: { contains: () => true }, layoutMode: 'modern', renderedLayoutMode: 'modern',
++  homeRouteEnterPending: true, isRestoringFocusFromBack: true, pendingBackFocusState: { id: 'saved' } });
++test('C1 return reconciles a mounted Home instead of replacing posters', () => {
++  assert.equal(decision('canUpdateInPlace', state()), true);
++});
++test('cold Home and layout changes still rebuild', () => {
++  assert.equal(decision('canUpdateInPlace', state(), true, false), false);
++  assert.equal(decision('canUpdateInPlace', { ...state(), layoutMode: 'grid' }), false);
++});
++test('other TVs retain their return behavior', () => {
++  assert.equal(decision('canUpdateInPlace', state(), false), false);
++});
++test('retained focus does not bypass saved Back focus restoration', () => {
++  assert.equal(decision('focusSurvived', state()), false);
++  assert.equal(decision('focusSurvived', { ...state(), isRestoringFocusFromBack: false, pendingBackFocusState: null }), true);
++});
+--- /dev/null
++++ b/scripts/test-c1-settings-navigation.mjs
+@@ -0,0 +1,87 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import vm from "node:vm";
++const read = name => fs.readFileSync("js/ui/screens/settings/" + name, "utf8")
++  .replace(/^import[\s\S]*?;\r?\n/gm, "").replace(/^export /gm, "");
++function setup(c1 = true) {
++  const sectionList = [{ id: "layout" }, { id: "playback" }];
++  const counts = { root: 0, nav: 0, content: 0, reflow: 0 };
++  const slot = name => ({
++    value: "", firstElementChild: null,
++    get innerHTML() { return this.value + (this.value ? "<!--runtime-->" : ""); },
++    set innerHTML(value) { counts[name]++; this.value = value; this.firstElementChild = {}; },
++    classList: { remove() {}, add() {}, toggle() {} },
++    get offsetWidth() { counts.reflow++; return 100; },
++    querySelectorAll: () => [], addEventListener() {}, removeEventListener() {}
++  });
++  const root = slot("root"), nav = slot("nav"), content = slot("content"), dialog = slot("dialog");
++  const buttons = sectionList.map(section => ({ dataset: { section: section.id }, selected: false,
++    classList: { toggle(name, selected) { section.selected = selected; } },
++    setAttribute(name, value) { section[name] = value; } }));
++  nav.querySelectorAll = () => buttons;
++  const shell = { dataset: {}, classList: { toggle() {} } };
++  const slots = { ".settings-shell": shell, "[data-settings-root-sidebar]": root,
++    "[data-settings-nav]": nav, "[data-settings-content]": content, "[data-settings-dialog]": dialog };
++  const context = vm.createContext({
++    document: { documentElement: { classList: { contains: () => c1 } } },
++    internals: {
++      ScreenUtils: { routeEnterClass: () => "", indexFocusables() {} },
++      renderRootSidebar: () => "<aside>Menu</aside>", bindRootSidebarEvents() {},
++      SECTION_META: sectionList, clamp: (v, a, b) => Math.max(a, Math.min(b, v)),
++      getVisibleSections: () => sectionList,
++      getSettingsSectionById: id => sectionList.find(s => s.id === id),
++      updateSettingsRailIndicatorsSoon() {}, updateSettingsScrollIndicatorsSoon() {},
++      syncLayoutPreviewMetricsSoon() {}, bindSettingsScrollIndicators() {},
++      captureSettingsScrollState: () => ({}), restoreSettingsScrollState() {},
++      escapeHtml: s => s, translateSectionCopy: s => ({ label: s.id }),
++      renderSectionNavIcon: () => "", iconSvg: () => "", ROW_ICONS: {},
++    }
++  });
++  vm.runInContext(read("settingsScreenMethods-01-get-current-rail-scroll-top.js") +
++    read("settingsScreenMethods-12-render-trakt-stats-strip.js"), context);
++  const screen = {
++    container: { querySelector: s => slots[s] || null },
++    model: { layout: {}, theme: {} }, activeSection: "layout", navIndex: 0,
++    ensureExpandedState() {}, persistUiState() {}, ensureShell() {},
++    renderNav: context.createSettingsScreenMethods01().renderNav,
++    renderSection: section => "<p>" + section.id + "</p>",
++    renderTextDialog: () => "", bindTextDialogEvents() {}, applyFocus() {}
++  };
++  const render = () => context.createSettingsScreenMethods12().render.call(screen, { refreshModel: false });
++  return { render, screen, counts, nav, root, sectionList };
++}
++test("C1 keeps navigation and root nodes while switching settings sections", async () => {
++  const f = setup(); await f.render();
++  f.screen.activeSection = "playback"; await f.render();
++  assert.equal(f.counts.nav, 1);
++  assert.equal(f.counts.root, 1);
++  assert.equal(f.counts.content, 2);
++  assert.equal(f.counts.reflow, 0);
++  assert.equal(f.sectionList[0].selected, false);
++  assert.equal(f.sectionList[1].selected, true);
++  assert.equal(f.sectionList[1]['aria-selected'], 'true');
++});
++test("C1 rebuilds a replaced nav slot instead of trusting stale cached markup", async () => {
++  const f = setup(); await f.render(); f.nav.firstElementChild = null;
++  await f.render(); assert.equal(f.counts.nav, 2);
++});
++test("other TVs retain section transition behavior", async () => {
++  const f = setup(false); await f.render();
++  f.screen.activeSection = "playback"; await f.render();
++  assert.equal(f.counts.reflow, 1);
++});
++
++test('C1 settings rail lands immediately without a spring animation', () => {
++  let frames = 0;
++  const ctx = vm.createContext({
++    document: { documentElement: { classList: { contains: () => true } } },
++    requestAnimationFrame: () => ++frames, cancelAnimationFrame() {}, performance: { now: () => 0 },
++    SETTINGS_RAIL_SCROLL_DAMPING_RATIO: 0.95, SETTINGS_RAIL_SCROLL_STIFFNESS: 180
++  });
++  vm.runInContext(read('settingsScreenHelpers-09-update-settings-marquee-targets.js'), ctx);
++  const rail = { scrollTop: 0, closest: () => null };
++  ctx.animateSettingsRailScroll(rail, 198);
++  assert.equal(rail.scrollTop, 198);
++  assert.equal(frames, 0);
++});

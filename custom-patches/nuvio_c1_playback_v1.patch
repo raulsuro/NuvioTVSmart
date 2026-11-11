@@ -1,289 +1,82 @@
-diff --git a/css/components-64.css b/css/components-64.css
---- a/css/components-64.css
-+++ b/css/components-64.css
-@@ -1,3 +1,7 @@
-+:root.webos-2021-fast-resume #home.c1-hero-entrance-pending .home-modern-hero-card {
-+  opacity: 0;
-+}
-+
- .home-hero-description.hero-description-autoscroll {
-   display: block;
-   -webkit-line-clamp: unset;
-diff --git a/js/ui/screens/home/c1HeroEntrance.js b/js/ui/screens/home/c1HeroEntrance.js
-new file mode 100644
---- /dev/null
-+++ b/js/ui/screens/home/c1HeroEntrance.js
-@@ -0,0 +1,52 @@
-+import { preloadImageSource } from "./homeScreenHelpers-02-extract-release-date-text.js";
-+import { Router } from "../../navigation/routerState.js";
-+
-+function enabled(screen) {
-+  return screen.layoutMode === "modern" &&
-+    document.documentElement.classList.contains("webos-2021-fast-resume");
-+}
-+
-+export function prepareC1HeroEntrance(screen) {
-+  if (enabled(screen) && !screen.c1HeroEntranceShown) {
-+    screen.container?.classList.add("c1-hero-entrance-pending");
-+  }
-+}
-+
-+export function revealC1HeroEntrance(screen, node, hero, display) {
-+  if (!enabled(screen) || !node || !hero) return;
-+  if (screen.c1HeroEntranceShown) {
-+    // A new title or refresh must never inherit the first hero's fade.
-+    screen.c1HeroEntranceAnimation?.cancel();
-+    screen.c1HeroEntranceAnimation = null;
-+    return;
-+  }
-+  const token = (screen.c1HeroEntranceToken || 0) + 1;
-+  screen.c1HeroEntranceToken = token;
-+  if (hero.heroMetaEnriching) return;
-+  const identity = String(hero.id || "");
-+  const current = () => screen.c1HeroEntranceToken === token &&
-+    !screen.c1HeroEntranceShown && Router.getCurrent() === "home" &&
-+    (!screen.heroItem || String(screen.heroItem.id || "") === identity) &&
-+    screen.container?.contains(node) && String(node.dataset.itemId || "") === identity;
-+  // Reuse the bounded image preload cache already used by the instant swaps.
-+  Promise.all([preloadImageSource(display?.backdrop), preloadImageSource(display?.logo)])
-+    .then(() => {
-+      if (!current()) return;
-+      requestAnimationFrame(() => {
-+        if (!current()) return;
-+        screen.c1HeroEntranceShown = true;
-+        screen.container.classList.remove("c1-hero-entrance-pending");
-+        const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
-+        if (!reduced && typeof node.animate === "function") {
-+          try {
-+            screen.c1HeroEntranceAnimation = node.animate(
-+              [{ opacity: 0 }, { opacity: 1 }],
-+              { duration: 180, easing: "ease-out" }
-+            );
-+          } catch (_) {
-+            // Visibility is already restored if this engine rejects animation.
-+          }
-+        }
-+      });
-+    });
-+}
-diff --git a/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js b/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
---- a/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
-+++ b/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
-@@ -1,3 +1,4 @@
-+import { revealC1HeroEntrance } from "./c1HeroEntrance.js";
- import { ensureHeroMdbListRatings } from "./homeHeroMdbListLoad.js";
- import { registerHomeDomNodes } from "./homeDomUpdate.js";
- import { createHeroDescriptionAutoScroller } from "./heroDescriptionAutoScroll.js";
-@@ -171,6 +172,7 @@
-       );
-       void ensureHeroMdbListRatings.call(this);
-       this.applyHeroDescriptionAutoScroll();
-+      revealC1HeroEntrance(this, heroNode, hero, display);
-     },
-     applyHeroDescriptionAutoScroll() {
-       const node = this.container?.querySelector(".home-hero-card .home-hero-description");
-diff --git a/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js b/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js
---- a/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js
-+++ b/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js
-@@ -14,6 +14,7 @@
-       if (!hero || !hero.id) {
-         return;
-       }
-+      const c1ResolvedHero = document.documentElement.classList.contains("webos-2021-fast-resume");
-       const currentHeroIdentity = buildHeroIdentity(this.heroItem);
-       const nextHeroIdentity = buildHeroIdentity(hero);
-       if (currentHeroIdentity === nextHeroIdentity && !this.heroItem?.heroMetaEnriching && !shouldEnrichModernHero(hero)) {
-@@ -59,7 +60,9 @@
-           if (buildHeroIdentity(focusedHero) !== scheduledHeroIdentity) {
+--- a/js/core/player/playerControllerMethods-18-play.js
++++ b/js/core/player/playerControllerMethods-18-play.js
+@@ -420,7 +420,8 @@
+           // Match Stremio's webOS startup order: src -> mediaId -> load -> play.
+           this.applyWebOsStagedNativeSource(playbackUrl, "native-file");
+           await this.prepareWebOsStagedNativePlayback(playToken, playbackUrl);
+-          if (!this.isPlaybackRequestActive(playToken, requestedUrl)) {
++          // The current URL may now be the resolved CDN or local proxy URL.
++          if (!this.isPlaybackRequestActive(playToken, playbackUrl)) {
              return;
            }
--          void preloadHeroAssets(focusedHero, "modern");
-+          if (!c1ResolvedHero || !shouldEnrichModernHero(focusedHero)) {
-+            void preloadHeroAssets(focusedHero, "modern");
-+          }
-         });
-       }, preloadDelay);
-       const commitHeroWhenSettled = () => {
-@@ -104,7 +107,11 @@
-           if (matchedIndex >= 0) {
-             this.heroIndex = matchedIndex;
-           }
--          this.applyHeroToDom();
-+          // C1: publish through the guarded enrichment commit, with artwork ready.
-+          // Keep the last hero visible instead of showing a temporary catalog preview.
-+          if (!c1ResolvedHero || !shouldEnrichHero) {
-+            this.applyHeroToDom();
-+          }
- 
-           if (shouldEnrichHero) {
-             void this.enrichCurrentHeroAsync(focusedHero, focusToken, { deferCommit: true });
-diff --git a/js/ui/screens/home/homeScreenMethods-23-render.js b/js/ui/screens/home/homeScreenMethods-23-render.js
---- a/js/ui/screens/home/homeScreenMethods-23-render.js
-+++ b/js/ui/screens/home/homeScreenMethods-23-render.js
-@@ -1,3 +1,4 @@
-+import { prepareC1HeroEntrance, revealC1HeroEntrance } from "./c1HeroEntrance.js";
- import { ensureHeroMdbListRatings } from "./homeHeroMdbListLoad.js";
- import * as internals from "./homeScreenContext.js";
- import { hasMountedHomeDom, updateHomeDom } from "./homeDomUpdate.js";
-@@ -40,6 +41,7 @@
- 
-   return {
-     render() {
-+      prepareC1HeroEntrance(this);
-       const renderStart = HOME_PERF_DEBUG ? homePerfNow() : 0;
-       this.cancelScheduledRender();
-       const liveFocusedNode = this.getCurrentFocusedNode();
-@@ -480,6 +482,9 @@
-       if (this.layoutMode === "grid") {
-         this.setupGridStickyHeader(showHeroSection);
-       }
-+      if (this.layoutMode === "modern" && heroItem) {
-+        revealC1HeroEntrance(this, this.container?.querySelector(".home-hero-card"), heroItem, buildModernHeroPresentation(heroItem));
-+      }
-       this.startHeroRotation();
-       if (this.layoutMode === "modern" && heroItem && shouldEnrichModernHero(heroItem)) {
-         void this.enrichCurrentHeroAsync(heroItem);
-diff --git a/scripts/test-c1-hero-entrance.mjs b/scripts/test-c1-hero-entrance.mjs
-new file mode 100644
+         } else {
 --- /dev/null
-+++ b/scripts/test-c1-hero-entrance.mjs
-@@ -0,0 +1,69 @@
++++ b/scripts/test-c1-playback-url.mjs
+@@ -0,0 +1,67 @@
 +import test from 'node:test';
 +import assert from 'node:assert/strict';
 +import fs from 'node:fs';
 +import vm from 'node:vm';
-+const path = 'js/ui/screens/home/c1HeroEntrance.js';
-+const source = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'function prepareC1HeroEntrance() {} function revealC1HeroEntrance() {}';
-+function fixture({ c1 = true, reduced = false } = {}) {
-+  const pending = [], frames = [], animations = [];
-+  const classes = new Set();
-+  const classList = { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) };
-+  const node = { dataset: { itemId: 'a' }, animate: (keys, options) => {
-+    const a = { keys, options, cancelled: false, cancel() { this.cancelled = true; } }; animations.push(a); return a;
-+  } };
-+  const screen = { layoutMode: 'modern', container: { classList, contains: n => n === node } };
-+  const ctx = vm.createContext({
-+    document: { documentElement: { classList: { contains: () => c1 } } },
-+    window: { matchMedia: () => ({ matches: reduced }) },
-+    Router: { getCurrent: () => 'home' },
-+    preloadImageSource: () => new Promise(resolve => pending.push(resolve)),
-+    requestAnimationFrame: fn => frames.push(fn)
-+  });
-+  vm.runInContext(source.replace(/^import .*;\s*$/gm, '').replaceAll('export function', 'function'), ctx);
-+  return { ctx, screen, node, classes, pending, frames, animations };
-+}
-+async function finish(f) {
-+  f.pending.splice(0).forEach(resolve => resolve(true));
-+  await new Promise(resolve => setImmediate(resolve));
-+  while (f.frames.length) f.frames.shift()();
-+}
-+test('first resolved hero waits for artwork and fades as one unit once', async () => {
-+  const f = fixture();
-+  f.ctx.prepareC1HeroEntrance(f.screen);
-+  assert.ok(f.classes.has('c1-hero-entrance-pending'));
-+  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, { backdrop: 'bg', logo: 'logo' });
-+  assert.equal(f.animations.length, 0);
-+  await finish(f);
-+  assert.equal(f.animations.length, 1);
-+  assert.equal(f.animations[0].options.duration, 180);
-+  assert.equal(f.classes.has('c1-hero-entrance-pending'), false);
-+  f.ctx.prepareC1HeroEntrance(f.screen);
-+  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'b' }, {});
-+  assert.equal(f.animations.length, 1);
-+  assert.equal(f.animations[0].cancelled, true);
-+  assert.equal(f.classes.has('c1-hero-entrance-pending'), false);
-+});
-+test('unresolved metadata cannot reveal the provisional hero', () => {
-+  const f = fixture(); f.ctx.prepareC1HeroEntrance(f.screen);
-+  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a', heroMetaEnriching: true }, {});
-+  assert.equal(f.pending.length, 0);
-+  assert.equal(f.animations.length, 0);
-+});
-+test('stale artwork completion cannot reveal a different hero', async () => {
-+  const f = fixture(); f.ctx.prepareC1HeroEntrance(f.screen);
-+  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, {});
-+  f.node.dataset.itemId = 'b'; await finish(f);
-+  assert.equal(f.animations.length, 0);
-+  assert.ok(f.classes.has('c1-hero-entrance-pending'));
-+});
-+test('reduced motion reveals without animation', async () => {
-+  const f = fixture({ reduced: true }); f.ctx.prepareC1HeroEntrance(f.screen);
-+  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, {}); await finish(f);
-+  assert.equal(f.animations.length, 0);
-+  assert.equal(f.classes.has('c1-hero-entrance-pending'), false);
-+});
-+test('other TVs remain untouched', () => {
-+  const f = fixture({ c1: false }); f.ctx.prepareC1HeroEntrance(f.screen);
-+  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, {});
-+  assert.equal(f.classes.size, 0); assert.equal(f.pending.length, 0);
-+});
-diff --git a/scripts/test-c1-hero-turbo.mjs b/scripts/test-c1-hero-turbo.mjs
---- a/scripts/test-c1-hero-turbo.mjs
-+++ b/scripts/test-c1-hero-turbo.mjs
-@@ -44,7 +44,7 @@
-     const ctx = vm.createContext({
-       document: { documentElement: { classList: { contains: () => isC1 } } },
-       HTMLImageElement: f.img.constructor,
--      ensureHeroMdbListRatings() {}, registerHomeDomNodes() {},
-+      ensureHeroMdbListRatings() {}, registerHomeDomNodes() {}, revealC1HeroEntrance() {},
-       internals: {
-         getTvHeroTransitionMode: () => 'single-layer',
-         buildModernHeroPresentation: () => ({ backdrop: 'new', title: 'New title' }),
-diff --git a/scripts/test-c1-resolved-hero.mjs b/scripts/test-c1-resolved-hero.mjs
-new file mode 100644
---- /dev/null
-+++ b/scripts/test-c1-resolved-hero.mjs
-@@ -0,0 +1,53 @@
-+import test from 'node:test';
-+import assert from 'node:assert/strict';
-+import fs from 'node:fs';
-+import vm from 'node:vm';
-+const source = fs.readFileSync(process.env.HERO_SCHEDULER || 'js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js', 'utf8');
-+function run(c1, needsEnrichment) {
-+  const timers = [], frames = [], preloads = [], commits = [], enrichments = [];
-+  const hero = { id: 'new', type: 'movie', heroMetaEnriched: !needsEnrichment };
-+  const node = { isConnected: true, classList: { contains: () => true } };
-+  const ctx = vm.createContext({
-+    document: { documentElement: { classList: { contains: () => c1 } } },
-+    internals: {
-+      MODERN_HOME_CONSTANTS: { heroRapidNavThresholdMs: 200 },
-+      shouldEnrichModernHero: () => needsEnrichment,
-+      preloadHeroAssets: h => preloads.push(h.id),
-+      buildHeroIdentity: h => h?.id || ''
-+    },
-+    isModernTvProfile: () => false, getTvRuntimePerformanceProfile: () => ({}),
-+    setTimeout: fn => { timers.push(fn); return timers.length; },
-+    requestAnimationFrame: fn => frames.push(fn)
-+  });
-+  vm.runInContext(source.replace(/^import .*;\s*$/gm, '').replace('export function', 'function'), ctx);
-+  const screen = {
-+    layoutMode: 'modern', heroItem: { id: 'old' }, heroCandidates: [],
-+    container: { querySelector: () => ({ classList: { add() {}, remove() {} } }) },
-+    getNodeHeroSource: () => hero, getCurrentFocusedNode: () => node,
-+    cancelPendingHeroFocus() {}, getHeroFocusDelay: () => 150,
-+    applyHeroToDom() { commits.push(this.heroItem.id); },
-+    enrichCurrentHeroAsync: (...args) => enrichments.push(args)
++
++const source = fs.readFileSync('js/core/player/playerControllerMethods-18-play.js', 'utf8')
++  .replace(/^import .*;\s*$/gm, '').replace('export function', 'function');
++async function run(route, invalidate = false) {
++  const original = 'https://addon.example/redirect/movie.mkv';
++  const resolved = 'https://cdn.example/movie.mkv';
++  const proxy = 'http://127.0.0.1:2710/proxy/movie.mkv';
++  let attempts = 0;
++  const webosProxy = {
++    requiresProxy: () => route !== 'unchanged',
++    resolve: async () => route === 'unchanged'
++      ? { status: 'not-required', proxied: false, url: original }
++      : { status: 'success', proxied: true, url: proxy }
 +  };
-+  ctx.createHomeScreenMethods10().scheduleModernHeroUpdate.call(screen, node);
-+  while (timers.length) timers.shift()();
-+  while (frames.length) frames.shift()();
-+  return { screen, preloads, commits, enrichments };
++  const ctx = vm.createContext({
++    URL, console,
++    observeProxyRedirects: () => () => {},
++    describeSourceHost: () => 'example',
++    isDirectMediaProbeResponse: () => true,
++    resolveTizenDirectRedirect: async () => route === 'redirect'
++      ? { reason: 'resolved', url: resolved, details: { status: 206 } }
++      : { reason: 'fetch-failed' },
++    internals: {
++      Platform: { isWebOS: () => true, isTizen: () => false },
++      WebOsPlaybackProxy: webosProxy, TizenPlaybackProxy: {},
++      logEngineFsDebug() {}, logTizenAvPlayDebug() {}, logWebOsPlaybackDebug() {}
++    }
++  });
++  vm.runInContext(source, ctx);
++  const state = {
++    playRequestToken: 0,
++    video: { querySelectorAll: () => [], pause() {}, removeAttribute() {}, load() {} },
++    resolveRuntimeSourceType: x => x,
++    resolveRemoteMediaSourceType: async () => 'video/x-matroska',
++    choosePlaybackEngine: () => 'native-file',
++    getPlatformAvplayEngineName: () => 'avplay',
++    isLikelyHlsMimeType: () => false,
++    isLikelyDashMimeType: () => false,
++    isTizenHlsSource: () => false,
++    isEngineFsPlaybackUrl: () => false,
++    normalizeMimeType: x => x,
++    isPlaybackRequestActive(token, url = null) {
++      return token === this.playRequestToken && (url === null || url === this.currentPlaybackUrl);
++    },
++    async prepareWebOsStagedNativePlayback() {
++      if (invalidate) this.playRequestToken += 1;
++    },
++    attemptVideoPlay() { attempts += 1; }
++  };
++  const controller = new Proxy(state, {
++    get(target, key) { return key in target ? target[key] : () => {}; }
++  });
++  await ctx.createPlayerControllerMethods18().play.call(controller, original, { requestHeaders: { Referer: 'https://addon.example/' } });
++  return { attempts, state };
 +}
-+test('C1 skips catalog preview and its artwork preload while resolving metadata', () => {
-+  const f = run(true, true);
-+  assert.deepEqual(f.commits, []);
-+  assert.deepEqual(f.preloads, []);
-+  assert.equal(f.enrichments.length, 1);
-+  assert.equal(f.enrichments[0][2].deferCommit, true);
-+});
-+test('C1 displays an already resolved catalog item immediately', () => {
-+  const f = run(true, false);
-+  assert.deepEqual(f.commits, ['new']);
-+  assert.equal(f.enrichments.length, 0);
-+});
-+test('other platforms retain the immediate preview', () => {
-+  const f = run(false, true);
-+  assert.deepEqual(f.commits, ['new']);
-+  assert.equal(f.preloads.length, 1);
-+  assert.equal(f.enrichments.length, 1);
-+});
++for (const route of ['redirect', 'proxy', 'unchanged']) {
++  test('staged webOS playback starts after ' + route, async () => {
++    assert.equal((await run(route)).attempts, 1);
++  });
++  test('cancelled staged playback stays stopped after ' + route, async () => {
++    assert.equal((await run(route, true)).attempts, 0);
++  });
++}

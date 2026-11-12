@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in nuvio_c1_1_4_0.patch; do
+          for p in nuvio_c1_1_4_0.patch nuvio_c1_menu_v2.patch; do
             echo "Checking and applying $p"
             git apply --check "$GITHUB_WORKSPACE/custom/custom-patches/$p"
             git apply "$GITHUB_WORKSPACE/custom/custom-patches/$p"
@@ -113,6 +113,7 @@ jobs:
           node --test js/ui/screens/home/homeImageCommitQueue.test.mjs
           node --test scripts/test-c1-playback-url.mjs
           node --test scripts/test-c1-home-return.mjs scripts/test-c1-settings-navigation.mjs
+          node --test scripts/test-c1-menu.mjs
           node --test scripts/test-settings-horizon-rail-scroll.mjs scripts/test-home-dom-inert-snapshots.mjs
           node --test scripts/test-c1-resolved-hero.mjs
           node --test scripts/test-c1-hero-entrance.mjs

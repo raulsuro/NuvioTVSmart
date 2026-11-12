@@ -1,0 +1,151 @@
+--- a/css/components-64.css
++++ b/css/components-64.css
+@@ -75,3 +75,23 @@
+ :root.webos-2021-fast-resume .home-screen-shell .home-hero-backdrop {
+   filter: none !important;
+ }
++
++/* C1 legacy sidebar: update geometry in one frame, without width animation. */
++:root.webos-2021-fast-resume .home-sidebar,
++:root.webos-2021-fast-resume .home-sidebar .home-nav-item,
++:root.webos-2021-fast-resume .home-sidebar .home-nav-label,
++:root.webos-2021-fast-resume .home-sidebar .home-profile-pill {
++  transition: none !important;
++  will-change: auto;
++}
++
++/* C1 settings focus: apply incoming and outgoing highlights in the same frame.
++   Include text/icons and pseudo-elements so they cannot fade behind the row. */
++:root.webos-2021-fast-resume .settings-shell .focusable,
++:root.webos-2021-fast-resume .settings-shell .focusable *,
++:root.webos-2021-fast-resume .settings-shell .focusable::before,
++:root.webos-2021-fast-resume .settings-shell .focusable::after,
++:root.webos-2021-fast-resume .settings-shell .focusable *::before,
++:root.webos-2021-fast-resume .settings-shell .focusable *::after {
++  transition: none !important;
++}
+--- a/js/ui/components/sidebarNavigationHelpers-03-render-root-sidebar.js
++++ b/js/ui/components/sidebarNavigationHelpers-03-render-root-sidebar.js
+@@ -113,6 +113,14 @@
+     sidebar._legacyOpenTimer = null;
+   }
+   const shouldExpand = Boolean(expanded);
++  if (globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume")) {
++    sidebar.classList.remove("opening");
++    sidebar.classList.toggle("content-expanded", shouldExpand);
++    sidebar.classList.toggle("expanded", shouldExpand);
++    syncSidebarStateClasses(container);
++    scheduleRootSidebarTextFit(container);
++    return;
++  }
+   if (shouldExpand) {
+     sidebar.classList.add("opening");
+     sidebar.classList.add("content-expanded");
+--- a/js/ui/screens/settings/settingsScreenHelpers-09-update-settings-marquee-targets.js
++++ b/js/ui/screens/settings/settingsScreenHelpers-09-update-settings-marquee-targets.js
+@@ -144,7 +144,12 @@
+ const SETTINGS_RAIL_HORIZONTAL_EDGE_PADDING = 24;
+ 
+ export function updateSettingsMarqueeTargets(root) {
++  const c1Fast = globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume");
+   root?.querySelectorAll?.(".settings-nav-label").forEach((label) => {
++    // Inactive, unchanged labels need no DOM writes or animation resets.
++    if (c1Fast && !label.closest(".settings-nav-item")?.classList.contains("focused") &&
++        !label._settingsMarqueeAnimation && !label.classList.contains("is-marquee-active") &&
++        label.dataset.marqueeText === String(label.textContent || "")) return;
+     label._settingsMarqueeAnimation?.cancel?.();
+     label._settingsMarqueeAnimation = null;
+     label.classList.remove("is-marquee-active");
+@@ -215,6 +220,12 @@
+     } else {
+       next = current;
+     }
++  } else if (globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume")) {
++    // Keep visible categories stationary; reveal only a clipped edge.
++    const itemStart = itemRect.top - railRect.top;
++    const itemEnd = itemStart + (itemRect.height || node.offsetHeight || 0);
++    next = itemStart < 0 ? current + itemStart
++      : itemEnd > clientSize ? current + itemEnd - clientSize : current;
+   } else {
+     const itemCenterInViewport = itemRect.top - railRect.top + (itemRect.height || node.offsetHeight || 0) / 2;
+     const targetCenter = clientSize * SETTINGS_RAIL_SCROLL_TARGET_RATIO;
+--- a/js/ui/screens/settings/settingsScreenMethods-13-apply-focus.js
++++ b/js/ui/screens/settings/settingsScreenMethods-13-apply-focus.js
+@@ -22,10 +22,12 @@
+ 
+   return {
+     applyFocus() {
++      const c1Fast = globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume");
++      try {
+       this.container.querySelectorAll(".focusable.focused").forEach((node) => node.classList.remove("focused"));
+-      updateSettingsMarqueeTargets(this.container);
++      if (!c1Fast) updateSettingsMarqueeTargets(this.container);
+       const selectedNode = this.container.querySelector(".settings-nav-item.selected");
+-      if (selectedNode && this.focusZone !== "nav") {
++      if (selectedNode && this.focusZone !== "nav" && (!c1Fast || this.focusZone !== "sidebar")) {
+         scrollSettingsRailItem(selectedNode);
+       }
+ 
+@@ -114,7 +116,11 @@
+           this.suppressNextRailFocusScroll = false;
+           scrollSettingsRailItem(navNode);
+         }
+-        updateSettingsMarqueeTargets(this.container);
++        if (!c1Fast) updateSettingsMarqueeTargets(this.container);
++      }
++      } finally {
++        // Run once with final focus, including dialog/content early returns.
++        if (c1Fast) updateSettingsMarqueeTargets(this.container);
+       }
+     },
+     async openSidebar() {
+--- /dev/null
++++ b/scripts/test-c1-menu.mjs
+@@ -0,0 +1,47 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++const read = p => fs.readFileSync(p,'utf8').replace(/^import[\s\S]*?;\r?\n/gm,'').replace(/^export /gm,'');
++const doc = c1 => ({documentElement:{classList:{contains:()=>c1}},body:{classList:{contains:()=>true}}});
++function railCase(top,c1=true){
++ const ctx=vm.createContext({document:doc(c1),clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),SETTINGS_RAIL_SCROLL_TARGET_RATIO:0.42});
++ vm.runInContext(read('js/ui/screens/settings/settingsScreenHelpers-09-update-settings-marquee-targets.js'),ctx);
++ const rail={scrollTop:100,scrollHeight:900,clientHeight:300,scrollWidth:200,clientWidth:200,getBoundingClientRect:()=>({top:0}),closest:()=>null};
++ const node={closest:()=>rail,getBoundingClientRect:()=>({top,height:60})};
++ ctx.scrollSettingsRailItem(node,{immediate:true});return rail.scrollTop;
++}
++test('C1 leaves a fully visible settings item in place',()=>assert.equal(railCase(100),100));
++test('C1 reveals only the clipped lower edge',()=>assert.equal(railCase(280),140));
++test('C1 reveals only the clipped upper edge',()=>assert.equal(railCase(-20),80));
++test('other TVs retain centred scrolling',()=>assert.equal(railCase(100,false),104));
++function sidebarCase(c1){
++ let layouts=0,frames=0,timers=0;const classes=new Set();
++ const sidebar={classList:{add:c=>classes.add(c),remove:c=>classes.delete(c),toggle:(c,on)=>on?classes.add(c):classes.delete(c)},get offsetWidth(){layouts++;return 200;}};
++ const ctx=vm.createContext({document:doc(c1),requestAnimationFrame:()=>++frames,setTimeout:()=>++timers,cancelAnimationFrame(){},clearTimeout(){},syncSidebarStateClasses(){},scheduleRootSidebarTextFit(){}});
++ vm.runInContext(read('js/ui/components/sidebarNavigationHelpers-03-render-root-sidebar.js'),ctx);
++ const container={querySelector:()=>sidebar};ctx.setLegacySidebarExpanded(container,true);
++ const opened=classes.has('expanded');ctx.setLegacySidebarExpanded(container,false);
++ return {opened,closed:!classes.has('expanded'),layouts,frames,timers};
++}
++test('C1 sidebar opens and closes synchronously without layout reads',()=>assert.deepEqual(sidebarCase(true),{opened:true,closed:true,layouts:0,frames:0,timers:0}));
++test('other TVs retain animated sidebar behavior',()=>assert.ok(sidebarCase(false).frames>0));
++function focusCase(zone){
++ let scrolls=0,marquees=0;
++ const node={classList:{add(){},remove(){}},closest:()=>null,dataset:{}};
++ const ctx=vm.createContext({document:doc(true),internals:{updateSettingsMarqueeTargets:()=>marquees++,scrollSettingsRailItem:()=>scrolls++,getRootSidebarNodes:()=>[node],getRootSidebarSelectedNode:()=>node,focusSettingsNode(){},setLegacySidebarExpanded(){},updateSettingsRailIndicators(){}}});
++ vm.runInContext(read('js/ui/screens/settings/settingsScreenMethods-13-apply-focus.js'),ctx);
++ const screen={container:{querySelectorAll:()=>[],querySelector:()=>node},focusZone:zone,layoutPrefs:{modernSidebar:true},sidebarFocusIndex:0,navIndex:0};
++ ctx.createSettingsScreenMethods13().applyFocus.call(screen);return {scrolls,marquees};
++}
++test('opening root sidebar never scrolls the settings rail',()=>assert.deepEqual(focusCase('sidebar'),{scrolls:0,marquees:1}));
++test('nav focus updates labels once after focus is assigned',()=>assert.deepEqual(focusCase('nav'),{scrolls:1,marquees:1}));
++test('unchanged inactive labels are not rewritten',()=>{
++ let writes=0,value='Playback';
++ const ctx=vm.createContext({document:doc(true),isContentRtl:()=>false});
++ vm.runInContext(read('js/ui/screens/settings/settingsScreenHelpers-09-update-settings-marquee-targets.js'),ctx);
++ const label={dataset:{},classList:{contains:()=>false,remove(){}},style:{removeProperty(){}},closest:()=>({classList:{contains:()=>false}}),setAttribute(){},get textContent(){return value;},set textContent(v){writes++;value=v;}};
++ const root={querySelectorAll:()=>[label]};
++ ctx.updateSettingsMarqueeTargets(root);assert.equal(writes,1);
++ ctx.updateSettingsMarqueeTargets(root);assert.equal(writes,1);
++});

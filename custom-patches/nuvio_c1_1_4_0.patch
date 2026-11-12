@@ -1,0 +1,1598 @@
+diff --git a/css/components-64.css b/css/components-64.css
+index 89205bc..7b6e8fa 100644
+--- a/css/components-64.css
++++ b/css/components-64.css
+@@ -1,3 +1,7 @@
++:root.webos-2021-fast-resume #home.c1-hero-entrance-pending .home-modern-hero-card {
++  opacity: 0;
++}
++
+ .home-hero-description.hero-description-autoscroll {
+   display: block;
+   -webkit-line-clamp: unset;
+@@ -47,3 +51,27 @@
+ .settings-action-row.settings-info-row .settings-row-value {
+   font-weight: 600;
+ }
++
++
++/* C1 Turbo hero: preserve available copy while focus/metadata settles.
++   Do not override opacity: trailer playback still controls its visibility. */
++:root.webos-2021-fast-resume .home-screen-shell.home-layout-modern .home-modern-hero-copy {
++  visibility: visible !important;
++}
++
++:root.webos-2021-fast-resume .home-screen-shell .home-modern-hero-copy,
++:root.webos-2021-fast-resume .home-screen-shell .home-modern-hero-copy *,
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-backdrop,
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-logo {
++  transition: none !important;
++}
++
++/* Only neutralize the enter state; preserve trailer-driven opacity rules. */
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-logo.home-hero-logo-transition-enter {
++  opacity: 1;
++}
++
++/* Avoid filtering the large backdrop on each repaint on Chromium 79. */
++:root.webos-2021-fast-resume .home-screen-shell .home-hero-backdrop {
++  filter: none !important;
++}
+diff --git a/js/app.js b/js/app.js
+index 1b9b450..c6bca6f 100644
+--- a/js/app.js
++++ b/js/app.js
+@@ -277,6 +277,10 @@ function applyPerformanceMode() {
+     modernSidebarBlurCapable
+   );
+   document.body.classList.toggle("modern-sidebar-blur-capable", modernSidebarBlurCapable);
++  // C1-specific hero and navigation behavior; keep 1.4.0 row windowing intact.
++  const c1FastReturn = Platform.isWebOS() && tvRuntime.tvYear === 2021 &&
++    tvRuntime.chromiumMajorVersion <= 79;
++  document.documentElement.classList.toggle("webos-2021-fast-resume", c1FastReturn);
+   document.documentElement.classList.toggle("legacy-webos", legacyWebOs);
+   document.body.classList.toggle("legacy-webos", legacyWebOs);
+   document.documentElement.classList.toggle("webos-unpromoted-home-tracks", unpromotedHomeTracks);
+diff --git a/js/core/player/playerControllerMethods-18-play.js b/js/core/player/playerControllerMethods-18-play.js
+index 18bad5c..3950c6a 100644
+--- a/js/core/player/playerControllerMethods-18-play.js
++++ b/js/core/player/playerControllerMethods-18-play.js
+@@ -420,7 +420,8 @@ export function createPlayerControllerMethods18() {
+           // Match Stremio's webOS startup order: src -> mediaId -> load -> play.
+           this.applyWebOsStagedNativeSource(playbackUrl, "native-file");
+           await this.prepareWebOsStagedNativePlayback(playToken, playbackUrl);
+-          if (!this.isPlaybackRequestActive(playToken, requestedUrl)) {
++          // The current URL may now be the resolved CDN or local proxy URL.
++          if (!this.isPlaybackRequestActive(playToken, playbackUrl)) {
+             return;
+           }
+         } else {
+diff --git a/js/platform/webos/webosCompanionService.js b/js/platform/webos/webosCompanionService.js
+index 9a00e1d..f06426d 100644
+--- a/js/platform/webos/webosCompanionService.js
++++ b/js/platform/webos/webosCompanionService.js
+@@ -2,6 +2,7 @@ import { WebOsLunaService } from "./webosLunaService.js";
+ 
+ const WEBOS_COMPANION_SERVICE_ID = "space.nuvio.webos.service";
+ const RECOVERABLE_METHODS = new Set(["ping", "status"]);
++const RECOVERABLE_SUBSCRIPTIONS = new Set(["enginefsKeepAlive", "playbackServiceKeepAlive"]);
+ 
+ function waitBeforeRecoveryRetry() {
+   return new Promise((resolve) => setTimeout(resolve, 100));
+@@ -86,10 +87,77 @@ export function subscribeWebOsCompanionService({
+     };
+   }
+ 
+-  return WebOsLunaService.subscribe(`luna://${serviceId}`, {
+-    method,
+-    parameters,
+-    onSuccess,
+-    onFailure
+-  });
++  // webOS may evict a Luna JS service between source selection and player
++  // startup. Keep-alive subscriptions must recover without a permanent
++  // external SSH process. Scope reconnection to playback keep-alives: other
++  // subscriptions retain their existing lifecycle and failure semantics.
++  const recoverable = RECOVERABLE_SUBSCRIPTIONS.has(method);
++  let closed = false;
++  let generation = 0;
++  let retryTimer = null;
++  let failures = 0;
++  let handle = null;
++
++  const scheduleRetry = () => {
++    if (!recoverable || closed || retryTimer) return;
++    const delayMs = Math.min(8000, 250 * 2 ** Math.min(failures, 5));
++    failures += 1;
++    retryTimer = setTimeout(() => {
++      retryTimer = null;
++      connect();
++    }, delayMs);
++  };
++
++  const connect = () => {
++    if (closed) return;
++    // Increment first, so a cancellation callback from the old handle cannot
++    // schedule another reconnect after a newer subscription has replaced it.
++    const currentGeneration = ++generation;
++    try {
++      handle?.cancel?.();
++    } catch (_) {
++      // A terminated webOS service may leave a handle that cannot be cancelled.
++    }
++    handle = null;
++    try {
++      handle = WebOsLunaService.subscribe(`luna://${serviceId}`, {
++        method,
++        parameters,
++        onSuccess: (payload) => {
++          if (closed || currentGeneration !== generation) return;
++          failures = 0;
++          if (retryTimer) {
++            clearTimeout(retryTimer);
++            retryTimer = null;
++          }
++          onSuccess?.(payload);
++        },
++        onFailure: (error) => {
++          if (closed || currentGeneration !== generation) return;
++          scheduleRetry();
++          onFailure?.(error);
++        }
++      });
++    } catch (error) {
++      if (!recoverable) throw error;
++      scheduleRetry();
++      onFailure?.(error);
++    }
++  };
++
++  connect();
++  return {
++    cancel() {
++      closed = true;
++      generation += 1;
++      if (retryTimer) clearTimeout(retryTimer);
++      retryTimer = null;
++      try {
++        handle?.cancel?.();
++      } catch (_) {
++        // Ignore cancellation failures during route cleanup.
++      }
++      handle = null;
++    }
++  };
+ }
+diff --git a/js/platform/webos/webosCompanionService.test.mjs b/js/platform/webos/webosCompanionService.test.mjs
+new file mode 100644
+index 0000000..92c9ac4
+--- /dev/null
++++ b/js/platform/webos/webosCompanionService.test.mjs
+@@ -0,0 +1,74 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { requestWebOsCompanionService, subscribeWebOsCompanionService } from "./webosCompanionService.js";
++const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++
++function mockBridge(t, onRequest) {
++  const oldWebOS = globalThis.webOS;
++  globalThis.webOS = { service: { request: (_url, args) => onRequest(args) } };
++  t.after(() => { globalThis.webOS = oldWebOS; });
++}
++
++test("status retry succeeds after initial companion failure", async (t) => {
++  let count = 0;
++  mockBridge(t, (args) => {
++    count += 1;
++    if (count === 1) queueMicrotask(() => args.onFailure({ errorText: "service not running" }));
++    else queueMicrotask(() => args.onSuccess({ returnValue: true, booted: true, url: "http://127.0.0.1:2710" }));
++    return { cancel() {} };
++  });
++  const result = await requestWebOsCompanionService({ method: "status", timeoutMs: 7000 });
++  assert.equal(count, 2);
++  assert.equal(result.payload.booted, true);
++});
++
++test("enginefsKeepAlive reconnects and cancel stops future retries", async (t) => {
++  let calls = 0;
++  let latest;
++  mockBridge(t, (args) => {
++    calls += 1;
++    latest = args;
++    if (calls === 1) queueMicrotask(() => args.onFailure({ errorText: "evicted" }));
++    else queueMicrotask(() => args.onSuccess({ returnValue: true }));
++    return { cancel() {} };
++  });
++  let successes = 0;
++  const subscription = subscribeWebOsCompanionService({
++    method: "enginefsKeepAlive",
++    onSuccess: () => { successes += 1; }
++  });
++  await delay(350);
++  assert.equal(calls, 2);
++  assert.equal(successes, 1);
++  subscription.cancel();
++  latest.onFailure({ errorText: "after cancel" });
++  await delay(350);
++  assert.equal(calls, 2);
++});
++
++test("cancel before a scheduled retry does not resubscribe", async (t) => {
++  let calls = 0;
++  mockBridge(t, (args) => {
++    calls += 1;
++    queueMicrotask(() => args.onFailure({ errorText: "evicted" }));
++    return { cancel() {} };
++  });
++  const subscription = subscribeWebOsCompanionService({ method: "enginefsKeepAlive" });
++  await delay(15);
++  subscription.cancel();
++  await delay(350);
++  assert.equal(calls, 1);
++});
++
++test("non-keepalive subscriptions are not reconnected", async (t) => {
++  let calls = 0;
++  mockBridge(t, (args) => {
++    calls += 1;
++    queueMicrotask(() => args.onFailure({ errorText: "failed" }));
++    return { cancel() {} };
++  });
++  const subscription = subscribeWebOsCompanionService({ method: "somethingElse" });
++  await delay(350);
++  subscription.cancel();
++  assert.equal(calls, 1);
++});
+diff --git a/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js b/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js
+index 1af8e22..7282d95 100644
+--- a/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js
++++ b/js/ui/screens/detail/metaDetailsScreenMethods-17-capture-detail-focus.js
+@@ -303,6 +303,12 @@ export function createMetaDetailsScreenMethods17() {
+         this.pendingEpisodeSelection ||
+         this.pendingMovieSelection ||
+         this.shouldSuppressTrailerAutoplay() ||
++        // On constrained LG webOS, auto-embedded YouTube trailers can show
++        // "Video player configuration error" while idle. Keep static artwork;
++        // manual trailer selection remains available.
++        (globalThis.__NUVIO_PLATFORM__ === "webos" &&
++          this.isPerformanceConstrained() &&
++          this.trailerSource.kind === "youtube") ||
+         !PlayerSettingsStore.get().trailerAutoplay
+       ) {
+         return;
+diff --git a/js/ui/screens/home/c1HeroEntrance.js b/js/ui/screens/home/c1HeroEntrance.js
+new file mode 100644
+index 0000000..d90283f
+--- /dev/null
++++ b/js/ui/screens/home/c1HeroEntrance.js
+@@ -0,0 +1,52 @@
++import { preloadImageSource } from "./homeScreenHelpers-02-extract-release-date-text.js";
++import { Router } from "../../navigation/routerState.js";
++
++function enabled(screen) {
++  return screen.layoutMode === "modern" &&
++    document.documentElement.classList.contains("webos-2021-fast-resume");
++}
++
++export function prepareC1HeroEntrance(screen) {
++  if (enabled(screen) && !screen.c1HeroEntranceShown) {
++    screen.container?.classList.add("c1-hero-entrance-pending");
++  }
++}
++
++export function revealC1HeroEntrance(screen, node, hero, display) {
++  if (!enabled(screen) || !node || !hero) return;
++  if (screen.c1HeroEntranceShown) {
++    // A new title or refresh must never inherit the first hero's fade.
++    screen.c1HeroEntranceAnimation?.cancel();
++    screen.c1HeroEntranceAnimation = null;
++    return;
++  }
++  const token = (screen.c1HeroEntranceToken || 0) + 1;
++  screen.c1HeroEntranceToken = token;
++  if (hero.heroMetaEnriching) return;
++  const identity = String(hero.id || "");
++  const current = () => screen.c1HeroEntranceToken === token &&
++    !screen.c1HeroEntranceShown && Router.getCurrent() === "home" &&
++    (!screen.heroItem || String(screen.heroItem.id || "") === identity) &&
++    screen.container?.contains(node) && String(node.dataset.itemId || "") === identity;
++  // Reuse the bounded image preload cache already used by the instant swaps.
++  Promise.all([preloadImageSource(display?.backdrop), preloadImageSource(display?.logo)])
++    .then(() => {
++      if (!current()) return;
++      requestAnimationFrame(() => {
++        if (!current()) return;
++        screen.c1HeroEntranceShown = true;
++        screen.container.classList.remove("c1-hero-entrance-pending");
++        const reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
++        if (!reduced && typeof node.animate === "function") {
++          try {
++            screen.c1HeroEntranceAnimation = node.animate(
++              [{ opacity: 0 }, { opacity: 1 }],
++              { duration: 180, easing: "ease-out" }
++            );
++          } catch (_) {
++            // Visibility is already restored if this engine rejects animation.
++          }
++        }
++      });
++    });
++}
+diff --git a/js/ui/screens/home/homeImageCommitQueue.test.mjs b/js/ui/screens/home/homeImageCommitQueue.test.mjs
+new file mode 100644
+index 0000000..3772b5b
+--- /dev/null
++++ b/js/ui/screens/home/homeImageCommitQueue.test.mjs
+@@ -0,0 +1,88 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { readFile } from "node:fs/promises";
++import vm from "node:vm";
++
++const source = await readFile(
++  new URL("./homeScreenMethods-24-schedule-home-lazy-image-hydration.js", import.meta.url),
++  "utf8"
++);
++
++function makeContext() {
++  const frames = [];
++  const context = vm.createContext({
++    internals: { HOME_LEGACY_LAZY_HYDRATION_MAX_PER_FRAME: 2 },
++    requestAnimationFrame: (callback) => {
++      frames.push(callback);
++      return frames.length;
++    }
++  });
++  context.HTMLElement = class {};
++  context.HTMLImageElement = class extends context.HTMLElement {};
++  context.globalThis = context;
++  // The factory already exists in the app. Stub just its imports so the test
++  // calls the real queue implementation without loading the whole Home UI.
++  const code = source
++    .replace(/^import [\s\S]*?;\s*/gm, "")
++    .replace("export function", "function");
++  vm.runInContext(`${code}\nglobalThis.methods = createHomeScreenMethods24();`, context);
++  return { frames, context };
++}
++
++function image(context, id) {
++  const node = new context.HTMLImageElement();
++  node.id = id;
++  node.dataset = { src: id };
++  node.isConnected = true;
++  node.closest = () => null;
++  return node;
++}
++
++test("Home queue deduplicates rapid focus entries and prioritizes the new focus", () => {
++  const { context, frames } = makeContext();
++  const row = {};
++  const first = image(context, "first");
++  const second = image(context, "second");
++  const focused = image(context, "focused");
++  const started = [];
++  const screen = {
++    ...context.methods,
++    assignHomeLazyImageSource(node) {
++      started.push(node.id);
++      delete node.dataset.src;
++    }
++  };
++  const entries = [first, second].map((node) => ({ image: node, src: node.id, row, priority: 2 }));
++  screen.commitHomeLazyImageSources(entries, null, row);
++  // Re-queueing an existing pending poster must not duplicate its request.
++  screen.commitHomeLazyImageSources(entries, null, row);
++  assert.equal(screen.homeLazyImageCommitQueue.length, 2);
++
++  const anchor = { contains: (node) => node === focused };
++  screen.commitHomeLazyImageSources([{ image: focused, src: focused.id, row, priority: 0 }], anchor, row);
++  assert.equal(screen.homeLazyImageCommitQueue.length, 3);
++  while (frames.length) frames.shift()();
++  assert.equal(started.length, 3);
++  assert.equal(started[0], "focused", "focused card should take the first slot");
++});
++
++test("Home queue drops images detached during navigation", () => {
++  const { context, frames } = makeContext();
++  const row = {};
++  const stale = image(context, "stale");
++  const live = image(context, "live");
++  const started = [];
++  const screen = {
++    ...context.methods,
++    assignHomeLazyImageSource(node) {
++      started.push(node.id);
++      delete node.dataset.src;
++    }
++  };
++  screen.commitHomeLazyImageSources([{ image: stale, src: "stale", row, priority: 1 }], null, row);
++  stale.isConnected = false;
++  screen.commitHomeLazyImageSources([{ image: live, src: "live", row, priority: 1 }], null, row);
++  assert.equal(screen.homeLazyImageCommitQueue.length, 1);
++  while (frames.length) frames.shift()();
++  assert.deepEqual(started, ["live"]);
++});
+diff --git a/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js b/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js
+index 36eab86..c4b2467 100644
+--- a/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js
++++ b/js/ui/screens/home/homeScreenHelpers-03-animate-hero-backdrop-swap.js
+@@ -236,6 +236,21 @@ export function animateHeroBackdropSwap(
+     return;
+   }
+ 
++  // C1: retain the current bitmap until ready, then swap without a fade,
++  // extra compositor layer, forced layout, or animation-frame delay.
++  if (transitionMode === "instant") {
++    preloadImageSource(normalizedSrc).then(() => {
++      if (Number(backdrop.heroBackdropTransitionToken || 0) !== token) {
++        return;
++      }
++      finalize();
++      backdrop.setAttribute("src", normalizedSrc);
++      backdrop.setAttribute("alt", normalizedAlt);
++      backdrop.classList.remove("placeholder");
++    });
++    return;
++  }
++
+   if (transitionMode === "single-layer") {
+     preloadImageSource(normalizedSrc).then((loaded) => {
+       if (Number(backdrop.heroBackdropTransitionToken || 0) !== token) {
+diff --git a/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js b/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js
+index d0a029c..6b35e00 100644
+--- a/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js
++++ b/js/ui/screens/home/homeScreenHelpers-04-animate-hero-logo-swap.js
+@@ -225,6 +225,20 @@ export function animateHeroLogoSwap(logoNode, nextSrc, nextAlt = "", durationMs
+     return;
+   }
+ 
++  // C1: retain the current bitmap until ready, then swap without a fade,
++  // extra compositor layer, forced layout, or animation-frame delay.
++  if (transitionMode === "instant") {
++    preloadImageSource(normalizedSrc).then(() => {
++      if (Number(logoNode.heroLogoTransitionToken || 0) !== token) {
++        return;
++      }
++      finalize();
++      logoNode.setAttribute("src", normalizedSrc);
++      logoNode.setAttribute("alt", normalizedAlt);
++    });
++    return;
++  }
++
+   if (transitionMode === "single-layer") {
+     preloadImageSource(normalizedSrc).then((loaded) => {
+       if (Number(logoNode.heroLogoTransitionToken || 0) !== token) {
+diff --git a/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js b/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
+index c4275e9..d9a446e 100644
+--- a/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
++++ b/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js
+@@ -1,3 +1,4 @@
++import { revealC1HeroEntrance } from "./c1HeroEntrance.js";
+ import { ensureHeroMdbListRatings } from "./homeHeroMdbListLoad.js";
+ import { registerHomeDomNodes } from "./homeDomUpdate.js";
+ import { createHeroDescriptionAutoScroller } from "./heroDescriptionAutoScroll.js";
+@@ -46,13 +47,14 @@ export function createHomeScreenMethods05() {
+       heroNode.classList.remove("is-hero-focus-pending");
+       const heroCrossfadeMs =
+         this.layoutMode === "modern" ? HOME_MODERN_HERO_BACKDROP_CROSSFADE_MS : HOME_LEGACY_HERO_BACKDROP_CROSSFADE_MS;
+-      const heroTransitionMode = getTvHeroTransitionMode();
++      const c1FastHero = document.documentElement.classList.contains("webos-2021-fast-resume");
++      const heroTransitionMode = c1FastHero ? "instant" : getTvHeroTransitionMode();
+ 
+       const backdrop = heroNode.querySelector(".home-hero-backdrop:not(.home-hero-backdrop-transition-ghost)");
+       if (backdrop) {
+         const src = display.backdrop || "";
+         if (backdrop instanceof HTMLImageElement) {
+-          const shouldFreezeBackdrop = Boolean(hero?.heroMetaEnriching) && String(backdrop.getAttribute("src") || "").trim();
++          const shouldFreezeBackdrop = (!c1FastHero || !src) && Boolean(hero?.heroMetaEnriching) && String(backdrop.getAttribute("src") || "").trim();
+           if (!shouldFreezeBackdrop) {
+             animateHeroBackdropSwap(backdrop, src, display.title || "featured", heroCrossfadeMs, {
+               transitionMode: heroTransitionMode
+@@ -97,7 +99,8 @@ export function createHomeScreenMethods05() {
+ 
+       const titleNode = heroNode.querySelector(".home-hero-title-text");
+       if (titleNode) {
+-        titleNode.textContent = display.title || "Untitled";
++        const nextTitle = display.title || "Untitled";
++        if (!c1FastHero || titleNode.textContent !== nextTitle) titleNode.textContent = nextTitle;
+         titleNode.classList.toggle("is-hidden", Boolean(display.logo));
+       }
+ 
+@@ -142,7 +145,8 @@ export function createHomeScreenMethods05() {
+ 
+       const descriptionNode = heroNode.querySelector(".home-hero-description");
+       if (descriptionNode) {
+-        descriptionNode.textContent = display.description || " ";
++        const nextDescription = display.description || " ";
++        if (!c1FastHero || descriptionNode.textContent !== nextDescription) descriptionNode.textContent = nextDescription;
+         descriptionNode.classList.toggle("is-empty", !display.description);
+       }
+       const mdbRow = heroNode.querySelector(".home-hero-mdb-ratings");
+@@ -168,6 +172,7 @@ export function createHomeScreenMethods05() {
+       );
+       void ensureHeroMdbListRatings.call(this);
+       this.applyHeroDescriptionAutoScroll();
++      revealC1HeroEntrance(this, heroNode, hero, display);
+     },
+     applyHeroDescriptionAutoScroll() {
+       const node = this.container?.querySelector(".home-hero-card .home-hero-description");
+diff --git a/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js b/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js
+index 517c776..e2f58f4 100644
+--- a/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js
++++ b/js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js
+@@ -14,6 +14,7 @@ export function createHomeScreenMethods10() {
+       if (!hero || !hero.id) {
+         return;
+       }
++      const c1ResolvedHero = document.documentElement.classList.contains("webos-2021-fast-resume");
+       const currentHeroIdentity = buildHeroIdentity(this.heroItem);
+       const nextHeroIdentity = buildHeroIdentity(hero);
+       if (currentHeroIdentity === nextHeroIdentity && !this.heroItem?.heroMetaEnriching && !shouldEnrichModernHero(hero)) {
+@@ -59,7 +60,9 @@ export function createHomeScreenMethods10() {
+           if (buildHeroIdentity(focusedHero) !== scheduledHeroIdentity) {
+             return;
+           }
+-          void preloadHeroAssets(focusedHero, "modern");
++          if (!c1ResolvedHero || !shouldEnrichModernHero(focusedHero)) {
++            void preloadHeroAssets(focusedHero, "modern");
++          }
+         });
+       }, preloadDelay);
+       const commitHeroWhenSettled = () => {
+@@ -94,7 +97,7 @@ export function createHomeScreenMethods10() {
+           const shouldEnrichHero = shouldEnrichModernHero(latestHero);
+           // While the dwell runs the hero is a plain, complete catalog hero:
+           // the enriching flag would keep the previous backdrop on screen.
+-          const enrichDwellMs = shouldEnrichHero ? getHeroEnrichDwellMs(getTvRuntimePerformanceProfile()) : 0;
++          const enrichDwellMs = shouldEnrichHero && !c1ResolvedHero ? getHeroEnrichDwellMs(getTvRuntimePerformanceProfile()) : 0;
+           const focusedHero =
+             shouldEnrichHero && !enrichDwellMs ? { ...latestHero, heroMetaEnriching: true } : { ...latestHero, heroMetaEnriching: false };
+ 
+@@ -108,7 +111,10 @@ export function createHomeScreenMethods10() {
+           if (matchedIndex >= 0) {
+             this.heroIndex = matchedIndex;
+           }
+-          this.applyHeroToDom();
++          // C1 keeps the resolved hero until the guarded enrichment commit.
++          if (!c1ResolvedHero || !shouldEnrichHero) {
++            this.applyHeroToDom();
++          }
+ 
+           if (shouldEnrichHero && enrichDwellMs) {
+             void preloadHeroAssets(focusedHero, "modern");
+diff --git a/js/ui/screens/home/homeScreenMethods-20-mount.js b/js/ui/screens/home/homeScreenMethods-20-mount.js
+index 4ad02be..c83a582 100644
+--- a/js/ui/screens/home/homeScreenMethods-20-mount.js
++++ b/js/ui/screens/home/homeScreenMethods-20-mount.js
+@@ -165,7 +165,10 @@ export function createHomeScreenMethods20() {
+         this.pendingCollectionRouteReturnAnimation = false;
+         this.ensureHomeTruncationObservers();
+         this.scheduleHomeTruncationUpdate();
+-        this.scheduleHomeLazyImageHydration();
++        // Search may have released Home's decoded posters while this preserved
++        // DOM was hidden. Prioritize the restored focused card on return and
++        // rebuild the index before loading nearby artwork.
++        this.scheduleHomeLazyImageHydration(this.getCurrentFocusedNode(), { refreshIndex: true });
+         this.scheduleReturnFocusRestore();
+         this.ensureStartupSyncSubscription();
+         this.refreshHomeAfterRouteReturn({
+diff --git a/js/ui/screens/home/homeScreenMethods-23-render.js b/js/ui/screens/home/homeScreenMethods-23-render.js
+index 4ed944a..8870a4e 100644
+--- a/js/ui/screens/home/homeScreenMethods-23-render.js
++++ b/js/ui/screens/home/homeScreenMethods-23-render.js
+@@ -1,3 +1,4 @@
++import { prepareC1HeroEntrance, revealC1HeroEntrance } from "./c1HeroEntrance.js";
+ import { ensureHeroMdbListRatings } from "./homeHeroMdbListLoad.js";
+ import * as internals from "./homeScreenContext.js";
+ import { hasMountedHomeDom, updateHomeDom } from "./homeDomUpdate.js";
+@@ -40,18 +41,20 @@ export function createHomeScreenMethods23() {
+ 
+   return {
+     render() {
++      prepareC1HeroEntrance(this);
+       const renderStart = HOME_PERF_DEBUG ? homePerfNow() : 0;
+       this.cancelScheduledRender();
+       const liveFocusedNode = this.getCurrentFocusedNode();
+       if (this.hasUserInteractedSinceHomePaint) {
+         this.forceInitialContinueWatchingFocus = false;
+       }
++      const c1Fast = globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume");
+       const canUpdateInPlace = Boolean(
+         hasMountedHomeDom(this.container) &&
+         this.renderedLayoutMode === this.layoutMode &&
+-        !this.homeRouteEnterPending &&
+-        !this.isRestoringFocusFromBack &&
+-        !this.pendingBackFocusState
++        (c1Fast || (!this.homeRouteEnterPending &&
++          !this.isRestoringFocusFromBack &&
++          !this.pendingBackFocusState))
+       );
+       this.teardownModernTrackScrollPagination();
+       this.teardownContinueWatchingProgressiveRendering();
+@@ -334,6 +337,8 @@ export function createHomeScreenMethods23() {
+         });
+       }
+       const focusSurvived = Boolean(
++        !this.isRestoringFocusFromBack &&
++        !this.pendingBackFocusState &&
+         updatedInPlace &&
+         liveFocusedNode?.isConnected &&
+         this.container.contains(liveFocusedNode) &&
+@@ -487,6 +492,9 @@ export function createHomeScreenMethods23() {
+       if (this.layoutMode === "grid") {
+         this.setupGridStickyHeader(showHeroSection);
+       }
++      if (this.layoutMode === "modern" && heroItem) {
++        revealC1HeroEntrance(this, this.container?.querySelector(".home-hero-card"), heroItem, buildModernHeroPresentation(heroItem));
++      }
+       this.startHeroRotation();
+       if (this.layoutMode === "modern" && heroItem && shouldEnrichModernHero(heroItem)) {
+         void this.enrichCurrentHeroAsync(heroItem);
+diff --git a/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js b/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js
+index 6526954..9719dec 100644
+--- a/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js
++++ b/js/ui/screens/home/homeScreenMethods-24-schedule-home-lazy-image-hydration.js
+@@ -484,17 +484,25 @@ export function createHomeScreenMethods24() {
+       };
+       const isCurrentFocusedImage = (image) =>
+         Boolean(anchorNode && (anchorNode === image || anchorNode.contains?.(image) || image.closest(".focusable") === anchorNode));
+-      pending.forEach((entry) => {
++      // Repeated D-pad focus changes used to perform a linear pending.findIndex
++      // for every candidate, leaving a quadratic hot path on catalog-heavy Home.
++      // Also drop detached/already hydrated entries before sorting the queue.
++      for (let index = pending.length - 1; index >= 0; index -= 1) {
++        const entry = pending[index];
++        if (!(entry?.image instanceof HTMLImageElement) || !entry.image.isConnected || !entry.image.dataset.src) {
++          pending.splice(index, 1);
++          continue;
++        }
+         entry.isFocusedImage = isCurrentFocusedImage(entry.image);
+         entry.priority = entry.row === anchorRow ? (entry.isFocusedImage ? 0 : 1) : 2;
+-      });
++      }
++      const pendingByImage = new Map(pending.map((entry) => [entry.image, entry]));
+       queued.forEach((entry) => {
+         if (!(entry?.image instanceof HTMLImageElement) || !entry.image.isConnected || !entry.image.dataset.src) {
+           return;
+         }
+-        const existingIndex = pending.findIndex((candidate) => candidate.image === entry.image);
+-        if (existingIndex >= 0) {
+-          const existing = pending[existingIndex];
++        const existing = pendingByImage.get(entry.image);
++        if (existing) {
+           existing.src = entry.src;
+           existing.row = entry.row;
+           existing.isFocusedRow = entry.isFocusedRow;
+@@ -503,7 +511,9 @@ export function createHomeScreenMethods24() {
+           existing.order = nextOrder();
+           return;
+         }
+-        pending.push({ ...entry, order: nextOrder() });
++        const added = { ...entry, order: nextOrder() };
++        pending.push(added);
++        pendingByImage.set(entry.image, added);
+       });
+       pending.sort((left, right) => left.priority - right.priority || left.order - right.order);
+       if (!pending.length || this.homeLazyImageCommitRaf) {
+diff --git a/js/ui/screens/search/searchPosterHydration.js b/js/ui/screens/search/searchPosterHydration.js
+new file mode 100644
+index 0000000..84808a1
+--- /dev/null
++++ b/js/ui/screens/search/searchPosterHydration.js
+@@ -0,0 +1,103 @@
++/**
++ * Bounded artwork loading for Smart TV search results.
++ *
++ * webOS Chromium can defer native loading="lazy" indefinitely for images in
++ * nested horizontal/vertical scroll containers. Search owns hydration just
++ * like Discover, and only starts nearby images in small per-frame batches.
++ */
++export const SEARCH_POSTER_PREFETCH_MARGIN_PX = 240;
++export const SEARCH_POSTER_BATCH_SIZE = 8;
++
++function overlaps(first, second, margin = 0) {
++  return (
++    first.bottom >= second.top - margin &&
++    first.top <= second.bottom + margin &&
++    first.right >= second.left - margin &&
++    first.left <= second.right + margin
++  );
++}
++
++export function hydrateSearchPosters(container, { margin = SEARCH_POSTER_PREFETCH_MARGIN_PX, batchSize = SEARCH_POSTER_BATCH_SIZE } = {}) {
++  const content = container?.querySelector?.(".search-content");
++  if (!content) return 0;
++  const viewport = content.getBoundingClientRect();
++  let started = 0;
++  for (const image of content.querySelectorAll(".search-result-poster[data-src]")) {
++    if (started >= batchSize) break;
++    if (!image.isConnected) continue;
++    const bounds = image.getBoundingClientRect();
++    if (!overlaps(bounds, viewport, margin)) continue;
++    const track = image.closest(".search-results-track");
++    if (track && !overlaps(bounds, track.getBoundingClientRect(), margin)) continue;
++    const source = String(image.dataset.src || "").trim();
++    image.removeAttribute("data-src");
++    if (!source) continue;
++    // The app has already decided this image is near the visible area.
++    image.loading = "eager";
++    image.src = source;
++    started += 1;
++  }
++  return started;
++}
++
++/** Capture complete image nodes so a Search re-render does not re-decode them. */
++export function captureLoadedSearchPosters(container) {
++  const loaded = new Map();
++  container?.querySelectorAll?.(".search-result-card .search-result-poster").forEach((image) => {
++    if (!image.complete || !(image.naturalWidth > 0)) return;
++    const card = image.closest(".search-result-card");
++    const source = image.getAttribute("src");
++    if (!card || !source) return;
++    const key = JSON.stringify([card.dataset.rowKey, card.dataset.itemType, card.dataset.itemId, source]);
++    loaded.set(key, image);
++  });
++  return loaded;
++}
++
++export function restoreLoadedSearchPosters(container, loaded) {
++  if (!loaded?.size) return 0;
++  let reused = 0;
++  container?.querySelectorAll?.(".search-result-card .search-result-poster").forEach((image) => {
++    const card = image.closest(".search-result-card");
++    if (!card) return;
++    const source = image.dataset.src || image.getAttribute("src");
++    const key = JSON.stringify([card.dataset.rowKey, card.dataset.itemType, card.dataset.itemId, source]);
++    const previous = loaded.get(key);
++    if (!previous || !image.parentNode) return;
++    image.parentNode.replaceChild(previous, image);
++    loaded.delete(key);
++    reused += 1;
++  });
++  return reused;
++}
++
++export function scheduleSearchPosterHydration(screen) {
++  if (!screen?.container || screen.searchPosterHydrationFrame) return;
++  screen.searchPosterHydrationFrame = requestAnimationFrame(() => {
++    screen.searchPosterHydrationFrame = 0;
++    if (!screen.searchPosterScrollTarget?.isConnected) return;
++    const started = hydrateSearchPosters(screen.container);
++    if (started === SEARCH_POSTER_BATCH_SIZE) scheduleSearchPosterHydration(screen);
++  });
++}
++
++/** Capture scroll events from the main viewport AND its nested result tracks. */
++export function bindSearchPosterHydration(screen) {
++  const content = screen?.container?.querySelector?.(".search-content");
++  if (screen.searchPosterScrollTarget !== content) {
++    screen.searchPosterScrollTarget?.removeEventListener("scroll", screen.searchPosterScrollHandler, true);
++    screen.searchPosterScrollTarget = content || null;
++    if (!screen.searchPosterScrollHandler) {
++      screen.searchPosterScrollHandler = () => scheduleSearchPosterHydration(screen);
++    }
++    content?.addEventListener("scroll", screen.searchPosterScrollHandler, { capture: true, passive: true });
++  }
++  scheduleSearchPosterHydration(screen);
++}
++
++export function unbindSearchPosterHydration(screen) {
++  screen.searchPosterScrollTarget?.removeEventListener("scroll", screen.searchPosterScrollHandler, true);
++  screen.searchPosterScrollTarget = null;
++  if (screen.searchPosterHydrationFrame) cancelAnimationFrame(screen.searchPosterHydrationFrame);
++  screen.searchPosterHydrationFrame = 0;
++}
+diff --git a/js/ui/screens/search/searchPosterHydration.test.mjs b/js/ui/screens/search/searchPosterHydration.test.mjs
+new file mode 100644
+index 0000000..07bf049
+--- /dev/null
++++ b/js/ui/screens/search/searchPosterHydration.test.mjs
+@@ -0,0 +1,132 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  hydrateSearchPosters,
++  captureLoadedSearchPosters,
++  restoreLoadedSearchPosters,
++  bindSearchPosterHydration,
++  unbindSearchPosterHydration
++} from "./searchPosterHydration.js";
++
++const rect = (top = 0, left = 0, width = 220, height = 330) => ({
++  top, left, bottom: top + height, right: left + width, width, height
++});
++
++function fixture({ posters = [{ url: "https://art/one.jpg", top: 80, left: 20 }] } = {}) {
++  const cards = [];
++  const images = [];
++  const trackBounds = rect(50, 0, 600, 400);
++  const track = { getBoundingClientRect: () => trackBounds };
++  const content = {
++    isConnected: true,
++    listeners: new Map(),
++    getBoundingClientRect: () => rect(0, 0, 1920, 1080),
++    querySelectorAll: (selector) => {
++      assert.equal(selector, ".search-result-poster[data-src]");
++      return images.filter((image) => image.dataset.src);
++    },
++    addEventListener(type, callback) { this.listeners.set(type, callback); },
++    removeEventListener(type) { this.listeners.delete(type); }
++  };
++  const container = {
++    querySelector: (selector) => selector === ".search-content" ? content : null,
++    querySelectorAll: (selector) => selector === ".search-result-card .search-result-poster" ? images : []
++  };
++  for (const [index, poster] of posters.entries()) {
++    const card = { dataset: { rowKey: "row-a", itemType: "movie", itemId: String(index + 1) } };
++    const source = poster.url;
++    const attrs = new Map();
++    const image = {
++      isConnected: true,
++      complete: false,
++      naturalWidth: 0,
++      dataset: { src: source },
++      loading: "lazy",
++      getBoundingClientRect: () => rect(poster.top, poster.left),
++      getAttribute: (key) => attrs.get(key) || null,
++      removeAttribute: (key) => { attrs.delete(key); if (key === "data-src") delete image.dataset.src; },
++      closest: (selector) => selector === ".search-results-track" ? track : selector === ".search-result-card" ? card : null,
++      parentNode: { replaceChild(newNode, oldNode) { const i = images.indexOf(oldNode); images[i] = newNode; newNode.parentNode = this; } }
++    };
++    Object.defineProperty(image, "src", { get() { return attrs.get("src") || ""; }, set(value) { attrs.set("src", value); } });
++    images.push(image);
++    cards.push(card);
++  }
++  return { content, container, images, cards, trackBounds };
++}
++
++test("loads nearby Search posters without depending on native lazy loading", () => {
++  const { container, images } = fixture({ posters: [
++    { url: "near", top: 100, left: 10 },
++    { url: "far", top: 4500, left: 10 }
++  ] });
++  assert.equal(hydrateSearchPosters(container), 1);
++  assert.equal(images[0].src, "near");
++  assert.equal(images[0].loading, "eager");
++  assert.equal(images[1].src, "");
++  assert.equal(images[1].dataset.src, "far");
++});
++
++test("does not trigger far-right images in a nested horizontal track", () => {
++  const { container, images } = fixture({ posters: [
++    { url: "near", top: 100, left: 50 },
++    { url: "offscreen", top: 100, left: 2000 }
++  ] });
++  assert.equal(hydrateSearchPosters(container), 1);
++  assert.equal(images[1].src, "");
++});
++
++test("limits image requests per frame", () => {
++  const { container, images } = fixture({ posters: Array.from({ length: 12 }, (_, i) => ({ url: `p${i}`, top: 100, left: 20 })) });
++  assert.equal(hydrateSearchPosters(container, { batchSize: 4 }), 4);
++  assert.equal(images.filter((image) => Boolean(image.src)).length, 4);
++  assert.equal(hydrateSearchPosters(container, { batchSize: 4 }), 4);
++  assert.equal(images.filter((image) => Boolean(image.src)).length, 8);
++});
++
++test("reuses complete poster nodes across Search rerenders", () => {
++  const original = fixture();
++  hydrateSearchPosters(original.container);
++  original.images[0].complete = true;
++  original.images[0].naturalWidth = 300;
++  const cache = captureLoadedSearchPosters(original.container);
++  const rerendered = fixture();
++  assert.equal(restoreLoadedSearchPosters(rerendered.container, cache), 1);
++  assert.equal(rerendered.images[0], original.images[0]);
++  assert.equal(rerendered.images[0].src, "https://art/one.jpg");
++});
++
++test("does not reuse a poster after the URL changes", () => {
++  const original = fixture();
++  hydrateSearchPosters(original.container);
++  original.images[0].complete = true;
++  original.images[0].naturalWidth = 300;
++  const cache = captureLoadedSearchPosters(original.container);
++  const updated = fixture({ posters: [{ url: "https://art/different.jpg", top: 80, left: 20 }] });
++  assert.equal(restoreLoadedSearchPosters(updated.container, cache), 0);
++  assert.equal(updated.images[0].src, "");
++});
++
++test("scroll events hydrate additional posters and cleanup cancels work", () => {
++  const { content, container, images } = fixture();
++  let sequence = 0;
++  const pending = new Map();
++  const oldRaf = globalThis.requestAnimationFrame;
++  const oldCancel = globalThis.cancelAnimationFrame;
++  globalThis.requestAnimationFrame = (callback) => { pending.set(++sequence, callback); return sequence; };
++  globalThis.cancelAnimationFrame = (id) => pending.delete(id);
++  try {
++    const screen = { container, searchPosterHydrationFrame: 0 };
++    bindSearchPosterHydration(screen);
++    assert.equal(content.listeners.has("scroll"), true);
++    for (const [id, callback] of [...pending]) { pending.delete(id); callback(); }
++    assert.equal(images[0].src, "https://art/one.jpg");
++    content.listeners.get("scroll")();
++    unbindSearchPosterHydration(screen);
++    assert.equal(content.listeners.has("scroll"), false);
++    assert.equal(pending.size, 0);
++  } finally {
++    globalThis.requestAnimationFrame = oldRaf;
++    globalThis.cancelAnimationFrame = oldCancel;
++  }
++});
+diff --git a/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js b/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js
+index 5eb1c84..41c9fb4 100644
+--- a/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js
++++ b/js/ui/screens/search/searchScreenMethods-01-get-route-state-key.js
+@@ -1,5 +1,10 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import {
++  bindSearchPosterHydration,
++  captureLoadedSearchPosters,
++  restoreLoadedSearchPosters
++} from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods01() {
+   const {
+@@ -335,11 +340,13 @@ export function createSearchScreenMethods01() {
+       }
+       const preserveInputEditing = document.activeElement === input;
+       const selectionSnapshot = preserveInputEditing ? null : getInputSelectionSnapshot(input);
++      const loadedPosters = captureLoadedSearchPosters(content);
+ 
+       while (header.nextSibling) {
+         header.nextSibling.remove();
+       }
+       content.insertAdjacentHTML("beforeend", this.renderRows());
++      restoreLoadedSearchPosters(content, loadedPosters);
+       ScreenUtils.indexFocusables(this.container);
+       this.buildNavigationModel();
+       this.bindActionEvents();
+@@ -354,6 +361,7 @@ export function createSearchScreenMethods01() {
+         restoreInputSelection(input, selectionSnapshot);
+       }
+       this.pendingAutoFocusResults = false;
++      bindSearchPosterHydration(this);
+     }
+   };
+ }
+diff --git a/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js b/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js
+index c089793..f0d2e85 100644
+--- a/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js
++++ b/js/ui/screens/search/searchScreenMethods-02-load-discover-rows.js
+@@ -1,4 +1,5 @@
+ import { customPosterForItem, posterFallbackAttributes } from "../../../core/poster/customPoster.js";
++import { normalizeTmdbPosterUrl } from "../../../core/tmdb/tmdbImageUrl.js";
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
+ 
+@@ -25,7 +26,8 @@ export function createSearchScreenMethods02() {
+     getSearchCatalogTimeoutMs,
+     formatReleaseYear,
+     withTimeout,
+-    buildRowStateKey
++    buildRowStateKey,
++    getTvRuntimePerformanceProfile
+   } = internals;
+ 
+   return {
+@@ -235,6 +237,7 @@ export function createSearchScreenMethods02() {
+       return buildRows();
+     },
+     renderRows() {
++      const useManagedPosters = getTvRuntimePerformanceProfile().isTvRuntime;
+       if (!Array.isArray(this.rows) || !this.rows.length) {
+         if (this.mode === "search") {
+           return `
+@@ -274,7 +277,10 @@ export function createSearchScreenMethods02() {
+             ${row.subtitle ? `<div class="search-results-subtitle" dir="${contentTextDirection(row.subtitle)}">${row.subtitle}</div>` : ""}
+             <div class="search-results-track">
+               ${(row.items || [])
+-                .map((item) => customPosterForItem(item, "search"))
++                .map((item) => {
++                  const visual = customPosterForItem(item, "search");
++                  return { ...visual, poster: normalizeTmdbPosterUrl(visual.poster) };
++                })
+                 .map(
+                   (item) => `
+                 <article class="search-result-card focusable"
+@@ -290,7 +296,7 @@ export function createSearchScreenMethods02() {
+                          data-catalog-type="${escapeHtml(row.type || item.catalogType || "")}"
+                          data-row-key="${escapeHtml(rowKey)}">
+                   <div class="search-result-poster-wrap">
+-                    ${item.poster ? `<img class="search-result-poster" ${posterFallbackAttributes(item)} src="${item.poster}" alt="" loading="lazy" decoding="async" />` : `<div class="search-result-poster placeholder"></div>`}
++                    ${item.poster ? `<img class="search-result-poster" ${posterFallbackAttributes(item)} ${useManagedPosters ? `data-src="${escapeHtml(item.poster)}"` : `src="${escapeHtml(item.poster)}"`} alt="" loading="${useManagedPosters ? "eager" : "lazy"}" decoding="async" />` : `<div class="search-result-poster placeholder"></div>`}
+                     ${isTitleItemWatched(item, this.watchedTitleIds) ? renderTitleWatchedBadge() : ""}
+                   </div>
+                   <div class="search-result-name" dir="${contentTextDirection(item.name || "Untitled")}">${item.name || "Untitled"}</div>
+diff --git a/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js b/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js
+index 1b2ddbf..49c694f 100644
+--- a/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js
++++ b/js/ui/screens/search/searchScreenMethods-03-render-recent-searches.js
+@@ -1,5 +1,10 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import {
++  bindSearchPosterHydration,
++  captureLoadedSearchPosters,
++  restoreLoadedSearchPosters
++} from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods03() {
+   const {
+@@ -67,6 +72,7 @@ export function createSearchScreenMethods03() {
+     render() {
+       this.cancelScheduledRender();
+       const queryText = this.query || "";
++      const loadedPosters = captureLoadedSearchPosters(this.container);
+       this.container.innerHTML = `
+           <div class="home-shell search-screen-shell${ScreenUtils.routeEnterClass(this, this.searchRouteEnterPending, " search-route-enter")}">
+             ${renderRootSidebar({
+@@ -114,6 +120,7 @@ export function createSearchScreenMethods03() {
+             </main>
+           </div>
+         `;
++      restoreLoadedSearchPosters(this.container, loadedPosters);
+       this.searchRouteEnterPending = false;
+ 
+       ScreenUtils.indexFocusables(this.container);
+@@ -140,6 +147,7 @@ export function createSearchScreenMethods03() {
+       } else {
+         this.pendingAutoFocusResults = false;
+       }
++      bindSearchPosterHydration(this);
+     },
+     isPosterHoldTarget(node) {
+       return (
+diff --git a/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js b/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js
+index cfef932..9f81fb1 100644
+--- a/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js
++++ b/js/ui/screens/search/searchScreenMethods-04-open-sidebar.js
+@@ -1,5 +1,6 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import { scheduleSearchPosterHydration } from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods04() {
+   const {
+@@ -111,6 +112,7 @@ export function createSearchScreenMethods04() {
+         this.ensureResultCardVisible(current, target);
+       }
+       this.captureLiveViewState();
++      scheduleSearchPosterHydration(this);
+       return true;
+     },
+     cancelScrollAnimation(container, axis = "x") {
+diff --git a/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js b/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js
+index 5c8c1f1..2ae6785 100644
+--- a/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js
++++ b/js/ui/screens/search/searchScreenMethods-06-activate-action-node.js
+@@ -1,5 +1,6 @@
+ /* eslint-disable no-unused-vars */
+ import * as internals from "./searchScreen.js";
++import { unbindSearchPosterHydration } from "./searchPosterHydration.js";
+ 
+ export function createSearchScreenMethods06() {
+   const {
+@@ -305,6 +306,7 @@ export function createSearchScreenMethods06() {
+       this.cancelActiveSearchRequests();
+       resetDpadRepeat(this);
+       this.cancelScheduledRender();
++      unbindSearchPosterHydration(this);
+       this.cancelPendingPosterHold();
+       this.posterOptionsMenu = null;
+       this.posterOptionsController?.destroy?.({ restoreFocus: false });
+diff --git a/js/ui/screens/settings/settingsScreenMethods-01-get-current-rail-scroll-top.js b/js/ui/screens/settings/settingsScreenMethods-01-get-current-rail-scroll-top.js
+index a99aaf1..3be6f5b 100644
+--- a/js/ui/screens/settings/settingsScreenMethods-01-get-current-rail-scroll-top.js
++++ b/js/ui/screens/settings/settingsScreenMethods-01-get-current-rail-scroll-top.js
+@@ -316,12 +316,12 @@ export function createSettingsScreenMethods01() {
+           }
+         });
+     },
+-    renderNav() {
++    renderNav({ includeSelection = true } = {}) {
+       return this.visibleSections
+         .map(
+           (item, index) => `
+-          <button class="settings-nav-item focusable${this.activeSection === item.id ? " selected" : ""}"
+-                  data-zone="nav" role="tab" aria-selected="${this.activeSection === item.id ? "true" : "false"}"
++          <button class="settings-nav-item focusable${includeSelection && this.activeSection === item.id ? " selected" : ""}"
++                  data-zone="nav" role="tab" aria-selected="${includeSelection && this.activeSection === item.id ? "true" : "false"}"
+                   data-nav-index="${index}"
+                   data-focus-key="nav:${item.id}"
+                   data-section="${item.id}">
+diff --git a/js/ui/screens/settings/settingsScreenMethods-12-render-trakt-stats-strip.js b/js/ui/screens/settings/settingsScreenMethods-12-render-trakt-stats-strip.js
+index ecf8707..a5c3d1b 100644
+--- a/js/ui/screens/settings/settingsScreenMethods-12-render-trakt-stats-strip.js
++++ b/js/ui/screens/settings/settingsScreenMethods-12-render-trakt-stats-strip.js
+@@ -241,6 +241,7 @@ export function createSettingsScreenMethods12() {
+       const contentSlot = this.container.querySelector("[data-settings-content]");
+       const dialogSlot = this.container.querySelector("[data-settings-dialog]");
+ 
++      const c1Fast = globalThis.document?.documentElement?.classList?.contains("webos-2021-fast-resume");
+       const rootSidebarHtml = renderRootSidebar({
+         selectedRoute: "settings",
+         profile: this.sidebarProfile,
+@@ -248,13 +249,28 @@ export function createSettingsScreenMethods12() {
+         expanded: Boolean(this.sidebarExpanded),
+         pillIconOnly: Boolean(this.pillIconOnly)
+       });
+-      if (rootSidebarSlot && rootSidebarSlot.innerHTML !== rootSidebarHtml) {
++      if (rootSidebarSlot && (c1Fast
++        ? this.c1RootSidebarSlot !== rootSidebarSlot || !rootSidebarSlot.firstElementChild || this.c1RootSidebarHtml !== rootSidebarHtml
++        : rootSidebarSlot.innerHTML !== rootSidebarHtml)) {
+         rootSidebarSlot.innerHTML = rootSidebarHtml;
++        this.c1RootSidebarSlot = rootSidebarSlot;
++        this.c1RootSidebarHtml = rootSidebarHtml;
+       }
+ 
+-      const navHtml = this.renderNav();
+-      if (navSlot && navSlot.innerHTML !== navHtml) {
++      const navHtml = this.renderNav({ includeSelection: !c1Fast });
++      if (navSlot && (c1Fast
++        ? this.c1NavSlot !== navSlot || !navSlot.firstElementChild || this.c1NavHtml !== navHtml
++        : navSlot.innerHTML !== navHtml)) {
+         navSlot.innerHTML = navHtml;
++        this.c1NavSlot = navSlot;
++        this.c1NavHtml = navHtml;
++      }
++      if (c1Fast && navSlot) {
++        navSlot.querySelectorAll(".settings-nav-item").forEach((node) => {
++          const selected = node.dataset.section === this.activeSection;
++          node.classList.toggle("selected", selected);
++          node.setAttribute("aria-selected", String(selected));
++        });
+       }
+       if (navSlot && this.railScrollNode !== navSlot) {
+         if (this.railScrollNode && this.handleRailScrollBound) {
+@@ -295,7 +311,7 @@ export function createSettingsScreenMethods12() {
+           if (previousScrollState) {
+             restoreSettingsScrollState(contentSlot, previousScrollState);
+           }
+-          if (sectionChanged) {
++          if (sectionChanged && !c1Fast) {
+             contentSlot.classList.remove("is-section-transitioning");
+             if (hadContent) {
+               // Restart the transition on reused content; new content animates anyway.
+diff --git a/scripts/test-c1-hero-entrance.mjs b/scripts/test-c1-hero-entrance.mjs
+new file mode 100644
+index 0000000..6221865
+--- /dev/null
++++ b/scripts/test-c1-hero-entrance.mjs
+@@ -0,0 +1,69 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++const path = 'js/ui/screens/home/c1HeroEntrance.js';
++const source = fs.existsSync(path) ? fs.readFileSync(path, 'utf8') : 'function prepareC1HeroEntrance() {} function revealC1HeroEntrance() {}';
++function fixture({ c1 = true, reduced = false } = {}) {
++  const pending = [], frames = [], animations = [];
++  const classes = new Set();
++  const classList = { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c) };
++  const node = { dataset: { itemId: 'a' }, animate: (keys, options) => {
++    const a = { keys, options, cancelled: false, cancel() { this.cancelled = true; } }; animations.push(a); return a;
++  } };
++  const screen = { layoutMode: 'modern', container: { classList, contains: n => n === node } };
++  const ctx = vm.createContext({
++    document: { documentElement: { classList: { contains: () => c1 } } },
++    window: { matchMedia: () => ({ matches: reduced }) },
++    Router: { getCurrent: () => 'home' },
++    preloadImageSource: () => new Promise(resolve => pending.push(resolve)),
++    requestAnimationFrame: fn => frames.push(fn)
++  });
++  vm.runInContext(source.replace(/^import .*;\s*$/gm, '').replaceAll('export function', 'function'), ctx);
++  return { ctx, screen, node, classes, pending, frames, animations };
++}
++async function finish(f) {
++  f.pending.splice(0).forEach(resolve => resolve(true));
++  await new Promise(resolve => setImmediate(resolve));
++  while (f.frames.length) f.frames.shift()();
++}
++test('first resolved hero waits for artwork and fades as one unit once', async () => {
++  const f = fixture();
++  f.ctx.prepareC1HeroEntrance(f.screen);
++  assert.ok(f.classes.has('c1-hero-entrance-pending'));
++  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, { backdrop: 'bg', logo: 'logo' });
++  assert.equal(f.animations.length, 0);
++  await finish(f);
++  assert.equal(f.animations.length, 1);
++  assert.equal(f.animations[0].options.duration, 180);
++  assert.equal(f.classes.has('c1-hero-entrance-pending'), false);
++  f.ctx.prepareC1HeroEntrance(f.screen);
++  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'b' }, {});
++  assert.equal(f.animations.length, 1);
++  assert.equal(f.animations[0].cancelled, true);
++  assert.equal(f.classes.has('c1-hero-entrance-pending'), false);
++});
++test('unresolved metadata cannot reveal the provisional hero', () => {
++  const f = fixture(); f.ctx.prepareC1HeroEntrance(f.screen);
++  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a', heroMetaEnriching: true }, {});
++  assert.equal(f.pending.length, 0);
++  assert.equal(f.animations.length, 0);
++});
++test('stale artwork completion cannot reveal a different hero', async () => {
++  const f = fixture(); f.ctx.prepareC1HeroEntrance(f.screen);
++  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, {});
++  f.node.dataset.itemId = 'b'; await finish(f);
++  assert.equal(f.animations.length, 0);
++  assert.ok(f.classes.has('c1-hero-entrance-pending'));
++});
++test('reduced motion reveals without animation', async () => {
++  const f = fixture({ reduced: true }); f.ctx.prepareC1HeroEntrance(f.screen);
++  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, {}); await finish(f);
++  assert.equal(f.animations.length, 0);
++  assert.equal(f.classes.has('c1-hero-entrance-pending'), false);
++});
++test('other TVs remain untouched', () => {
++  const f = fixture({ c1: false }); f.ctx.prepareC1HeroEntrance(f.screen);
++  f.ctx.revealC1HeroEntrance(f.screen, f.node, { id: 'a' }, {});
++  assert.equal(f.classes.size, 0); assert.equal(f.pending.length, 0);
++});
+diff --git a/scripts/test-c1-hero-turbo.mjs b/scripts/test-c1-hero-turbo.mjs
+new file mode 100644
+index 0000000..1921a70
+--- /dev/null
++++ b/scripts/test-c1-hero-turbo.mjs
+@@ -0,0 +1,98 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++
++const root = process.env.HERO_SOURCE || '.';
++function fixture(kind) {
++  const file = kind === 'backdrop' ? '03-animate-hero-backdrop-swap' : '04-animate-hero-logo-swap';
++  const source = fs.readFileSync(`${root}/js/ui/screens/home/homeScreenHelpers-${file}.js`, 'utf8');
++  const pending = [];
++  const frames = [];
++  let ghosts = 0;
++  let enters = 0;
++  class Img {
++    constructor() {
++      this.attrs = { src: 'old' };
++      const classes = new Set();
++      this.classList = { add: (...xs) => xs.forEach(x => classes.add(x)), remove: (...xs) => xs.forEach(x => classes.delete(x)), contains: x => classes.has(x) };
++      this.parentElement = { querySelectorAll: () => [], insertBefore: () => ghosts++ };
++    }
++    getAttribute(k) { return this.attrs[k]; }
++    setAttribute(k, v) { this.attrs[k] = v; }
++    removeAttribute(k) { delete this.attrs[k]; }
++    remove() { this.removed = true; }
++    cloneNode() { return new Img(); }
++  }
++  const ctx = vm.createContext({ HTMLImageElement: Img, HOME_MODERN_HERO_BACKDROP_CROSSFADE_MS: 400,
++    preloadImageSource: src => new Promise(resolve => pending.push({ src, resolve })),
++    prepareHeroImageEnter: () => enters++, requestAnimationFrame: fn => frames.push(fn), setTimeout: () => {} });
++  vm.runInContext(source.replace(/^import [\s\S]*?;\s*/gm, '').replaceAll('export function', 'function'), ctx);
++  const fn = ctx[kind === 'backdrop' ? 'animateHeroBackdropSwap' : 'animateHeroLogoSwap'];
++  return { img: new Img(), pending, frames, swap: fn, ghosts: () => ghosts, enters: () => enters };
++}
++test('C1 starts available backdrop during metadata enrichment; other TVs retain upstream behavior', () => {
++  const source = fs.readFileSync(`${root}/js/ui/screens/home/homeScreenMethods-05-apply-hero-to-dom.js`, 'utf8');
++  for (const isC1 of [true, false]) {
++    const f = fixture('backdrop');
++    const swaps = [];
++    const heroNode = {
++      dataset: {}, classList: { toggle() {}, remove() {} },
++      querySelector: selector => selector.startsWith('.home-hero-backdrop:') ? f.img : null,
++      querySelectorAll: () => []
++    };
++    const ctx = vm.createContext({
++      document: { documentElement: { classList: { contains: () => isC1 } } },
++      HTMLImageElement: f.img.constructor,
++      ensureHeroMdbListRatings() {}, registerHomeDomNodes() {}, revealC1HeroEntrance() {},
++      internals: {
++        getTvHeroTransitionMode: () => 'single-layer',
++        buildModernHeroPresentation: () => ({ backdrop: 'new', title: 'New title' }),
++        animateHeroBackdropSwap: (...args) => swaps.push(args)
++      }
++    });
++    vm.runInContext(source.replace(/^import [\s\S]*?;\s*/gm, '').replace('export function', 'function'), ctx);
++    const screen = {
++      container: { querySelector: () => heroNode },
++      heroItem: { id: 'new', heroMetaEnriching: true }, layoutMode: 'modern',
++      scheduleHomeTruncationUpdate() {}, syncCollectionHeroMedia() {}, applyHeroDescriptionAutoScroll() {}
++    };
++    ctx.createHomeScreenMethods05().applyHeroToDom.call(screen);
++    assert.equal(swaps.length, isC1 ? 1 : 0);
++    if (isC1) assert.equal(swaps[0][4].transitionMode, 'instant');
++  }
++});
++for (const kind of ['backdrop', 'logo']) {
++  test(`${kind}: instant swap retains old image until loaded, without fades or clones`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'new', 'Title', 400, { transitionMode: 'instant' });
++    assert.equal(f.img.attrs.src, 'old');
++    f.pending[0].resolve(true); await Promise.resolve();
++    assert.equal(f.img.attrs.src, 'new');
++    assert.equal(f.frames.length, 0);
++    assert.equal(f.ghosts(), 0);
++    assert.equal(f.enters(), 0);
++  });
++  test(`${kind}: stale load cannot replace newer selection`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'stale', '', 400, { transitionMode: 'instant' });
++    f.swap(f.img, 'latest', '', 400, { transitionMode: 'instant' });
++    f.pending[1].resolve(true); await Promise.resolve();
++    f.pending[0].resolve(true); await Promise.resolve();
++    assert.equal(f.img.attrs.src, 'latest');
++  });
++  test(`${kind}: failed preload still delegates to image fallback`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'failed', '', 400, { transitionMode: 'instant' });
++    f.pending[0].resolve(false); await Promise.resolve();
++    assert.equal(f.img.attrs.src, 'failed');
++  });
++  test(`${kind}: normal crossfade is preserved`, async () => {
++    const f = fixture(kind);
++    f.swap(f.img, 'new');
++    f.pending[0].resolve(true); await Promise.resolve();
++    assert.equal(f.ghosts(), 1);
++    assert.equal(f.enters(), 1);
++    assert.equal(f.frames.length, 1);
++  });
++}
+diff --git a/scripts/test-c1-home-return.mjs b/scripts/test-c1-home-return.mjs
+new file mode 100644
+index 0000000..a419b9c
+--- /dev/null
++++ b/scripts/test-c1-home-return.mjs
+@@ -0,0 +1,28 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++const source = fs.readFileSync('js/ui/screens/home/homeScreenMethods-23-render.js', 'utf8');
++function decision(name, state, c1 = true, mounted = true) {
++  const expression = source.match(new RegExp('const ' + name + ' = (Boolean\\([\\s\\S]*?\\n      \\));'))?.[1];
++  assert.ok(expression, name + ' declaration');
++  const context = vm.createContext({ state, c1Fast: c1, hasMountedHomeDom: () => mounted,
++    updatedInPlace: true, liveFocusedNode: { isConnected: true, classList: { contains: () => true } } });
++  return vm.runInContext('(function(){ return ' + expression + '; }).call(state)', context);
++}
++const state = () => ({ container: { contains: () => true }, layoutMode: 'modern', renderedLayoutMode: 'modern',
++  homeRouteEnterPending: true, isRestoringFocusFromBack: true, pendingBackFocusState: { id: 'saved' } });
++test('C1 return reconciles a mounted Home instead of replacing posters', () => {
++  assert.equal(decision('canUpdateInPlace', state()), true);
++});
++test('cold Home and layout changes still rebuild', () => {
++  assert.equal(decision('canUpdateInPlace', state(), true, false), false);
++  assert.equal(decision('canUpdateInPlace', { ...state(), layoutMode: 'grid' }), false);
++});
++test('other TVs retain their return behavior', () => {
++  assert.equal(decision('canUpdateInPlace', state(), false), false);
++});
++test('retained focus does not bypass saved Back focus restoration', () => {
++  assert.equal(decision('focusSurvived', state()), false);
++  assert.equal(decision('focusSurvived', { ...state(), isRestoringFocusFromBack: false, pendingBackFocusState: null }), true);
++});
+diff --git a/scripts/test-c1-playback-url.mjs b/scripts/test-c1-playback-url.mjs
+new file mode 100644
+index 0000000..d7c9e27
+--- /dev/null
++++ b/scripts/test-c1-playback-url.mjs
+@@ -0,0 +1,67 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++
++const source = fs.readFileSync('js/core/player/playerControllerMethods-18-play.js', 'utf8')
++  .replace(/^import .*;\s*$/gm, '').replace('export function', 'function');
++async function run(route, invalidate = false) {
++  const original = 'https://addon.example/redirect/movie.mkv';
++  const resolved = 'https://cdn.example/movie.mkv';
++  const proxy = 'http://127.0.0.1:2710/proxy/movie.mkv';
++  let attempts = 0;
++  const webosProxy = {
++    requiresProxy: () => route !== 'unchanged',
++    resolve: async () => route === 'unchanged'
++      ? { status: 'not-required', proxied: false, url: original }
++      : { status: 'success', proxied: true, url: proxy }
++  };
++  const ctx = vm.createContext({
++    URL, console,
++    observeProxyRedirects: () => () => {},
++    describeSourceHost: () => 'example',
++    isDirectMediaProbeResponse: () => true,
++    resolveTizenDirectRedirect: async () => route === 'redirect'
++      ? { reason: 'resolved', url: resolved, details: { status: 206 } }
++      : { reason: 'fetch-failed' },
++    internals: {
++      Platform: { isWebOS: () => true, isTizen: () => false },
++      WebOsPlaybackProxy: webosProxy, TizenPlaybackProxy: {},
++      logEngineFsDebug() {}, logTizenAvPlayDebug() {}, logWebOsPlaybackDebug() {}
++    }
++  });
++  vm.runInContext(source, ctx);
++  const state = {
++    playRequestToken: 0,
++    video: { querySelectorAll: () => [], pause() {}, removeAttribute() {}, load() {} },
++    resolveRuntimeSourceType: x => x,
++    resolveRemoteMediaSourceType: async () => 'video/x-matroska',
++    choosePlaybackEngine: () => 'native-file',
++    getPlatformAvplayEngineName: () => 'avplay',
++    isLikelyHlsMimeType: () => false,
++    isLikelyDashMimeType: () => false,
++    isTizenHlsSource: () => false,
++    isEngineFsPlaybackUrl: () => false,
++    normalizeMimeType: x => x,
++    isPlaybackRequestActive(token, url = null) {
++      return token === this.playRequestToken && (url === null || url === this.currentPlaybackUrl);
++    },
++    async prepareWebOsStagedNativePlayback() {
++      if (invalidate) this.playRequestToken += 1;
++    },
++    attemptVideoPlay() { attempts += 1; }
++  };
++  const controller = new Proxy(state, {
++    get(target, key) { return key in target ? target[key] : () => {}; }
++  });
++  await ctx.createPlayerControllerMethods18().play.call(controller, original, { requestHeaders: { Referer: 'https://addon.example/' } });
++  return { attempts, state };
++}
++for (const route of ['redirect', 'proxy', 'unchanged']) {
++  test('staged webOS playback starts after ' + route, async () => {
++    assert.equal((await run(route)).attempts, 1);
++  });
++  test('cancelled staged playback stays stopped after ' + route, async () => {
++    assert.equal((await run(route, true)).attempts, 0);
++  });
++}
+diff --git a/scripts/test-c1-resolved-hero.mjs b/scripts/test-c1-resolved-hero.mjs
+new file mode 100644
+index 0000000..6ab7cd7
+--- /dev/null
++++ b/scripts/test-c1-resolved-hero.mjs
+@@ -0,0 +1,53 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import vm from 'node:vm';
++const source = fs.readFileSync(process.env.HERO_SCHEDULER || 'js/ui/screens/home/homeScreenMethods-10-schedule-modern-hero-update.js', 'utf8');
++function run(c1, needsEnrichment) {
++  const timers = [], frames = [], preloads = [], commits = [], enrichments = [];
++  const hero = { id: 'new', type: 'movie', heroMetaEnriched: !needsEnrichment };
++  const node = { isConnected: true, classList: { contains: () => true } };
++  const ctx = vm.createContext({
++    document: { documentElement: { classList: { contains: () => c1 } } },
++    internals: {
++      MODERN_HOME_CONSTANTS: { heroRapidNavThresholdMs: 200 },
++      shouldEnrichModernHero: () => needsEnrichment,
++      preloadHeroAssets: h => preloads.push(h.id),
++      buildHeroIdentity: h => h?.id || ''
++    },
++    getHeroEnrichDwellMs: () => 0, isModernTvProfile: () => false, getTvRuntimePerformanceProfile: () => ({}),
++    setTimeout: fn => { timers.push(fn); return timers.length; },
++    requestAnimationFrame: fn => frames.push(fn)
++  });
++  vm.runInContext(source.replace(/^import .*;\s*$/gm, '').replace('export function', 'function'), ctx);
++  const screen = {
++    layoutMode: 'modern', heroItem: { id: 'old' }, heroCandidates: [],
++    container: { querySelector: () => ({ classList: { add() {}, remove() {} } }) },
++    getNodeHeroSource: () => hero, getCurrentFocusedNode: () => node,
++    cancelPendingHeroFocus() {}, getHeroFocusDelay: () => 150,
++    applyHeroToDom() { commits.push(this.heroItem.id); },
++    enrichCurrentHeroAsync: (...args) => enrichments.push(args)
++  };
++  ctx.createHomeScreenMethods10().scheduleModernHeroUpdate.call(screen, node);
++  while (timers.length) timers.shift()();
++  while (frames.length) frames.shift()();
++  return { screen, preloads, commits, enrichments };
++}
++test('C1 skips catalog preview and its artwork preload while resolving metadata', () => {
++  const f = run(true, true);
++  assert.deepEqual(f.commits, []);
++  assert.deepEqual(f.preloads, []);
++  assert.equal(f.enrichments.length, 1);
++  assert.equal(f.enrichments[0][2].deferCommit, true);
++});
++test('C1 displays an already resolved catalog item immediately', () => {
++  const f = run(true, false);
++  assert.deepEqual(f.commits, ['new']);
++  assert.equal(f.enrichments.length, 0);
++});
++test('other platforms retain the immediate preview', () => {
++  const f = run(false, true);
++  assert.deepEqual(f.commits, ['new']);
++  assert.equal(f.preloads.length, 1);
++  assert.equal(f.enrichments.length, 1);
++});
+diff --git a/scripts/test-c1-settings-navigation.mjs b/scripts/test-c1-settings-navigation.mjs
+new file mode 100644
+index 0000000..1826d84
+--- /dev/null
++++ b/scripts/test-c1-settings-navigation.mjs
+@@ -0,0 +1,87 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import vm from "node:vm";
++const read = name => fs.readFileSync("js/ui/screens/settings/" + name, "utf8")
++  .replace(/^import[\s\S]*?;\r?\n/gm, "").replace(/^export /gm, "");
++function setup(c1 = true) {
++  const sectionList = [{ id: "layout" }, { id: "playback" }];
++  const counts = { root: 0, nav: 0, content: 0, reflow: 0 };
++  const slot = name => ({
++    value: "", firstElementChild: null,
++    get innerHTML() { return this.value + (this.value ? "<!--runtime-->" : ""); },
++    set innerHTML(value) { counts[name]++; this.value = value; this.firstElementChild = {}; },
++    classList: { remove() {}, add() {}, toggle() {} },
++    get offsetWidth() { counts.reflow++; return 100; },
++    querySelectorAll: () => [], addEventListener() {}, removeEventListener() {}
++  });
++  const root = slot("root"), nav = slot("nav"), content = slot("content"), dialog = slot("dialog");
++  const buttons = sectionList.map(section => ({ dataset: { section: section.id }, selected: false,
++    classList: { toggle(name, selected) { section.selected = selected; } },
++    setAttribute(name, value) { section[name] = value; } }));
++  nav.querySelectorAll = () => buttons;
++  const shell = { dataset: {}, classList: { toggle() {} } };
++  const slots = { ".settings-shell": shell, "[data-settings-root-sidebar]": root,
++    "[data-settings-nav]": nav, "[data-settings-content]": content, "[data-settings-dialog]": dialog };
++  const context = vm.createContext({
++    document: { documentElement: { classList: { contains: () => c1 } } },
++    internals: {
++      ScreenUtils: { routeEnterClass: () => "", indexFocusables() {} },
++      renderRootSidebar: () => "<aside>Menu</aside>", bindRootSidebarEvents() {},
++      SECTION_META: sectionList, clamp: (v, a, b) => Math.max(a, Math.min(b, v)),
++      getVisibleSections: () => sectionList,
++      getSettingsSectionById: id => sectionList.find(s => s.id === id),
++      updateSettingsRailIndicatorsSoon() {}, updateSettingsScrollIndicatorsSoon() {},
++      syncLayoutPreviewMetricsSoon() {}, bindSettingsScrollIndicators() {},
++      captureSettingsScrollState: () => ({}), restoreSettingsScrollState() {},
++      escapeHtml: s => s, translateSectionCopy: s => ({ label: s.id }),
++      renderSectionNavIcon: () => "", iconSvg: () => "", ROW_ICONS: {},
++    }
++  });
++  vm.runInContext(read("settingsScreenMethods-01-get-current-rail-scroll-top.js") +
++    read("settingsScreenMethods-12-render-trakt-stats-strip.js"), context);
++  const screen = {
++    container: { querySelector: s => slots[s] || null },
++    model: { layout: {}, theme: {} }, activeSection: "layout", navIndex: 0,
++    ensureExpandedState() {}, persistUiState() {}, ensureShell() {},
++    renderNav: context.createSettingsScreenMethods01().renderNav,
++    renderSection: section => "<p>" + section.id + "</p>",
++    renderTextDialog: () => "", bindTextDialogEvents() {}, applyFocus() {}
++  };
++  const render = () => context.createSettingsScreenMethods12().render.call(screen, { refreshModel: false });
++  return { render, screen, counts, nav, root, sectionList };
++}
++test("C1 keeps navigation and root nodes while switching settings sections", async () => {
++  const f = setup(); await f.render();
++  f.screen.activeSection = "playback"; await f.render();
++  assert.equal(f.counts.nav, 1);
++  assert.equal(f.counts.root, 1);
++  assert.equal(f.counts.content, 2);
++  assert.equal(f.counts.reflow, 0);
++  assert.equal(f.sectionList[0].selected, false);
++  assert.equal(f.sectionList[1].selected, true);
++  assert.equal(f.sectionList[1]['aria-selected'], 'true');
++});
++test("C1 rebuilds a replaced nav slot instead of trusting stale cached markup", async () => {
++  const f = setup(); await f.render(); f.nav.firstElementChild = null;
++  await f.render(); assert.equal(f.counts.nav, 2);
++});
++test("other TVs retain section transition behavior", async () => {
++  const f = setup(false); await f.render();
++  f.screen.activeSection = "playback"; await f.render();
++  assert.equal(f.counts.reflow, 1);
++});
++
++test('C1 settings rail lands immediately without a spring animation', () => {
++  let frames = 0;
++  const ctx = vm.createContext({
++    document: { body: { classList: { contains: () => true } } },
++    requestAnimationFrame: () => ++frames, cancelAnimationFrame() {}, performance: { now: () => 0 },
++    SETTINGS_RAIL_SCROLL_DAMPING_RATIO: 0.95, SETTINGS_RAIL_SCROLL_STIFFNESS: 180
++  });
++  vm.runInContext(read('settingsScreenHelpers-09-update-settings-marquee-targets.js'), ctx);
++  const rail = { scrollTop: 0, closest: () => null };
++  ctx.animateSettingsRailScroll(rail, 198);
++  assert.equal(rail.scrollTop, 198);
++  assert.equal(frames, 0);
++});

@@ -1,18 +1,16 @@
-name: Nuvio LG C1 - patched webOS IPK
+name: Nuvio LG C1 - 1.4.0 validated port
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Upstream stable version, e.g. 1.3.7 (blank = highest stable tag)'
+        description: 'Pinned C1 port: 1.4.0 only'
         required: false
         type: string
       force_rebuild:
         description: 'Rebuild even if this version already has a custom release'
         type: boolean
         default: false
-  schedule:
-    - cron: '27 5 * * *' # Daily; only builds newly tagged versions.
 
 permissions:
   contents: write # Creates downloadable custom IPK releases on YOUR fork.
@@ -39,15 +37,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "$REQUESTED_TAG" ]]; then
-            tag="$REQUESTED_TAG"
-          else
-            # 'releases/latest' can lag behind the app update feed; use published
-            # stable Git tags. Never auto-select a prerelease tag.
-            tag="$(gh api --paginate 'repos/NuvioMedia/NuvioTVSmart/tags?per_page=100' \
-              --jq '.[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)"
-          fi
-          [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid stable tag: $tag"; exit 1; }
+          tag="${REQUESTED_TAG:-1.4.0}"
+          [[ "$tag" == '1.4.0' ]] || { echo 'This tested port supports only 1.4.0'; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Selected upstream tag $tag"
 
@@ -72,7 +63,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NuvioMedia/NuvioTVSmart
-          ref: ${{ steps.version.outputs.tag }}
+          ref: ec5e15c050c7ac98ede4e201a97bc4f93b96420e # upstream 1.4.0
           path: nuvio
 
       - name: Apply all local patches (stop on conflict)
@@ -81,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in nuvio_webos_reliability.patch nuvio_webos_ui_performance.patch nuvio_home_performance_v2.patch nuvio_c1_polish_v2.patch nuvio_c1_turbo_v1.patch nuvio_c1_hero_v2.patch nuvio_c1_hero_v4.patch nuvio_c1_playback_v1.patch nuvio_c1_navigation_v1.patch; do
+          for p in nuvio_c1_1_4_0.patch; do
             echo "Checking and applying $p"
             git apply --check "$GITHUB_WORKSPACE/custom/custom-patches/$p"
             git apply "$GITHUB_WORKSPACE/custom/custom-patches/$p"
@@ -126,7 +117,8 @@ jobs:
           node --test scripts/test-c1-resolved-hero.mjs
           node --test scripts/test-c1-hero-entrance.mjs
           node --test scripts/test-c1-hero-turbo.mjs
-          node --test js/ui/images/tvPosterRescalerPool.test.mjs js/ui/screens/home/homeArtworkLifecycle.test.mjs
+          npm run test:perf
+          node --test scripts/test-webos-resume-back-parity.mjs scripts/test-webos-startup-gate-release.mjs scripts/test-webos-enginefs-status-startup.mjs
 
       - name: Lint and build webOS package
         if: steps.existing.outputs.skip != 'true'

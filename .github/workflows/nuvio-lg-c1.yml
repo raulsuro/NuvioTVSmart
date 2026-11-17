@@ -1,10 +1,10 @@
-name: Nuvio LG C1 - 1.4.2 validated port
+name: Nuvio LG C1 - 1.4.3 validated port
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Pinned C1 port: 1.4.2 only'
+        description: 'Pinned C1 port: 1.4.3 only'
         required: false
         type: string
       force_rebuild:
@@ -37,8 +37,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${REQUESTED_TAG:-1.4.2}"
-          [[ "$tag" == '1.4.2' ]] || { echo 'This tested port supports only 1.4.2'; exit 1; }
+          tag="${REQUESTED_TAG:-1.4.3}"
+          [[ "$tag" == '1.4.3' ]] || { echo 'This tested port supports only 1.4.3'; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Selected upstream tag $tag"
 
@@ -63,7 +63,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NuvioMedia/NuvioTVSmart
-          ref: 57cac39ef8ded97efb07e441a4f33f80700a5ca8 # upstream 1.4.2
+          ref: 701fa41c4f0c029783cf381204c76d02aeb9f16e # upstream 1.4.3
           path: nuvio
 
       - name: Apply all local patches (stop on conflict)
@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in nuvio_c1_1_4_2.patch; do
+          for p in nuvio_c1_1_4_3.patch; do
             echo "Checking and applying $p"
             git apply --check "$GITHUB_WORKSPACE/custom/custom-patches/$p"
             git apply "$GITHUB_WORKSPACE/custom/custom-patches/$p"
@@ -109,7 +109,8 @@ jobs:
           node --test scripts/test-c1-hero-entrance.mjs
           node --test scripts/test-c1-hero-turbo.mjs
           node --test scripts/test-auth-qr-back-navigation.mjs scripts/test-profile-scoped-store-cache.mjs scripts/test-sidebar-label-fit.mjs
-          node --test scripts/test-source-fallback.mjs scripts/test-expired-link-refresh.mjs scripts/test-search-last-input-focus.mjs scripts/test-subtitle-appearance.mjs scripts/test-autosync-search-scopes.mjs scripts/test-continue-watching-stability.mjs scripts/test-continue-watching-click-action.mjs scripts/test-continue-watching-play-manually.mjs js/core/debrid/torboxCacheAliases.test.mjs js/ui/screens/home/homeGridColumns.test.mjs js/ui/screens/home/homeLegacyRowMarkup.test.mjs scripts/test-plugin-playback-proxy.mjs scripts/test-plugin-http-legacy-runtime.cjs js/core/player/pluginResourceGovernor.test.mjs
+          node --test scripts/test-source-fallback.mjs scripts/test-expired-link-refresh.mjs scripts/test-search-last-input-focus.mjs scripts/test-subtitle-appearance.mjs scripts/test-autosync-search-scopes.mjs scripts/test-continue-watching-stability.mjs scripts/test-continue-watching-click-action.mjs scripts/test-continue-watching-play-manually.mjs js/core/debrid/torboxCacheAliases.test.mjs js/ui/screens/home/homeGridColumns.test.mjs js/ui/screens/home/homeLegacyRowMarkup.test.mjs scripts/test-plugin-http-legacy-runtime.cjs js/core/player/pluginResourceGovernor.test.mjs
+          node --test js/data/repository/catalogRepository.test.mjs scripts/test-next-episode-prefetch-guard.mjs scripts/test-mdblist-storage-compaction.mjs js/core/player/subtitlePresentationCapabilities-hdr-brightness.test.mjs js/ui/screens/player/playerScreenMethods-52-53-hdr-text-color.test.mjs scripts/test-tizen-ambient-exit.mjs scripts/test-tizen-service-start-order.mjs
           npm run test:perf
           node --test scripts/test-webos-resume-back-parity.mjs scripts/test-webos-startup-gate-release.mjs scripts/test-webos-enginefs-status-startup.mjs
 

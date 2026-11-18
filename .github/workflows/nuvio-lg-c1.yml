@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in nuvio_c1_1_4_3_focus.patch; do
+          for p in nuvio_c1_1_4_3_tiles.patch; do
             echo "Checking and applying $p"
             git apply --check "$GITHUB_WORKSPACE/custom/custom-patches/$p"
             git apply "$GITHUB_WORKSPACE/custom/custom-patches/$p"
